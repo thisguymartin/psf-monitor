@@ -1,11 +1,12 @@
 import type { AgentId, AgentNode, Harness, MessageLink, SourceKind } from "../domain.ts";
 import { compactNumber, shortPath, working } from "../format.ts";
 import { countsOf, isLive, rootOf, rootsOf, treeOf } from "../graph.ts";
-import type { Delta, ServerInfo, Snapshot, SourceHealth, TimelineAppend, TimelinePage } from "../wire.ts";
+import type { Delta, JournalResponse, ServerInfo, Snapshot, SourceHealth, TimelineAppend, TimelinePage } from "../wire.ts";
 import { Canvas } from "./canvas.ts";
+import { postJson } from "./commands.ts";
 import { h, icon, logo } from "./dom.ts";
 import { Panel, PANEL_MIN } from "./panel.ts";
-import { Rail, type Descendants, type Scope } from "./rail.ts";
+import { Rail, type Descendants } from "./rail.ts";
 
 // The page controller: one event stream, one state,
 // and a render that every view reads from.
@@ -20,9 +21,8 @@ const RETRY_MS = 3_000;
 /** Canvas kept visible beside the panel; narrower than this and the panel overlays it. */
 const CANVAS_MIN = 360;
 const PANEL_GUTTER = 240;
-const SCOPE_KEY = "psf-monitor.scope";
 
-type Connection = "connecting" | "live" | "retrying" | "expired";
+type Connection = "connecting" | "live" | "retrying" | "expired" | "stopped";
 
 interface State {
   nodes: Map<AgentId, AgentNode>;
@@ -33,21 +33,11 @@ interface State {
   agent: AgentId | null;
   connection: Connection;
   dismissed: string;
-  scope: Scope;
 }
 
 const params = new URLSearchParams(location.search);
 const defaultHarness: Harness = params.get("harness") === "codex" ? "codex" : "claude";
 let pendingFocus = params.get("focus") as AgentId | null;
-
-function initialScope(): Scope {
-  if (params.get("all") === "1") return "all";
-  try {
-    return localStorage.getItem(SCOPE_KEY) === "all" ? "all" : "pstack";
-  } catch {
-    return "pstack";
-  }
-}
 
 const state: State = {
   nodes: new Map(),
@@ -58,14 +48,7 @@ const state: State = {
   agent: null,
   connection: "connecting",
   dismissed: "",
-  scope: initialScope(),
 };
-
-/** The agents the current scope shows: pstack's trees, or everything. */
-function visible(): Map<AgentId, AgentNode> {
-  if (state.scope === "all") return state.nodes;
-  return new Map([...state.nodes].filter(([, node]) => node.pstack));
-}
 
 const canvas = new Canvas({ select: (id) => selectAgent(id) });
 const panel = new Panel({
@@ -74,7 +57,7 @@ const panel = new Panel({
   loadOlder: (agent, before) => fetchTimeline(agent, before),
   resized: (width, settled) => canvas.setRightInset(insetFor(width), settled),
 });
-const rail = new Rail({ select: (root) => selectSession(root), toggleScope: () => setScope(state.scope === "pstack" ? "all" : "pstack") });
+const rail = new Rail({ select: (root) => selectSession(root) });
 
 const sessionTitle = h("h1", { class: "bar-title" });
 const sessionPath = h("span", { class: "bar-path mono" });
@@ -84,16 +67,100 @@ const live = h("div", { class: "live", attrs: { role: "status" } }, h("span", { 
 const railToggle = h("button", { class: "icon-button rail-toggle", title: "Sessions", attrs: { type: "button", "aria-label": "Show sessions" } }, icon("sessions"));
 railToggle.addEventListener("click", () => toggleRail());
 const banner = h("div", { class: "banner", attrs: { hidden: "", role: "note" } });
+const journalButton = h("button", { class: "quiet-action", attrs: { type: "button" } });
+const stopButton = h("button", { class: "quiet-action", attrs: { type: "button" } }, icon("stop"), h("span", { text: "Stop monitor" }));
+const controlMessage = h("span", { class: "bar-command-message", attrs: { role: "status", hidden: "" } });
+const barControls = h("div", { class: "bar-controls" }, journalButton, stopButton, controlMessage);
 
 const bar = h(
   "header",
   { class: "bar" },
   railToggle,
-  h("div", { class: "brand" }, logo(), h("span", { class: "brand-name", text: "pstack monitor" })),
+  h("div", { class: "brand" }, logo(), h("span", { class: "brand-name", text: "psf-monitor" })),
   h("div", { class: "bar-session" }, sessionTitle, sessionPath),
   stats,
+  barControls,
   live,
 );
+
+let journalConfirmUntil = 0;
+let stopConfirmUntil = 0;
+let journalPending = false;
+let stopPending = false;
+
+function renderControls(): void {
+  const journal = state.server?.journal === true;
+  const journalArmed = journal && journalConfirmUntil > Date.now();
+  journalButton.replaceChildren(icon("lane"), h("span", { text: state.server === null ? "Journal…" : journalPending ? "Updating…" : journalArmed ? "Confirm: Delete recorded lanes?" : `Journal: ${journal ? "on" : "off"}` }));
+  journalButton.title = journal ? "Turn off lane journal and delete its records" : "Turn on lane journal";
+  journalButton.disabled = state.server === null || journalPending || state.connection === "stopped";
+  stopButton.replaceChildren(icon("stop"), h("span", { text: stopPending ? "Stopping…" : stopConfirmUntil > Date.now() ? "Confirm: Stop monitor?" : "Stop monitor" }));
+  stopButton.disabled = state.server === null || stopPending || state.connection === "stopped";
+}
+
+function controlError(message: string): void {
+  controlMessage.textContent = message;
+  controlMessage.hidden = message.length === 0;
+}
+
+journalButton.addEventListener("click", () => {
+  if (state.server?.journal === true && journalConfirmUntil <= Date.now()) {
+    journalConfirmUntil = Date.now() + 4_000;
+    renderControls();
+    window.setTimeout(renderControls, 4_050);
+    return;
+  }
+  journalConfirmUntil = 0;
+  journalPending = true;
+  controlError("");
+  renderControls();
+  void (async () => {
+    try {
+      const { status, data } = await postJson<JournalResponse>("/api/journal", { on: state.server?.journal !== true });
+      if (status !== 200 || !data.ok) controlError(data.message);
+      else if (state.server !== null) state.server = { ...state.server, journal: data.journal };
+    } catch {
+      controlError("Could not reach the monitor.");
+    }
+    journalPending = false;
+    renderControls();
+  })();
+});
+
+stopButton.addEventListener("click", () => {
+  if (stopConfirmUntil <= Date.now()) {
+    stopConfirmUntil = Date.now() + 4_000;
+    renderControls();
+    window.setTimeout(renderControls, 4_050);
+    return;
+  }
+  stopConfirmUntil = 0;
+  stopPending = true;
+  controlError("");
+  renderControls();
+  void (async () => {
+    try {
+      const { status, data } = await postJson<{ ok: boolean; message?: string }>("/api/stop", {});
+      if (status !== 200 || !data.ok) controlError(data.message ?? "Could not stop the monitor.");
+      else {
+        source?.close();
+        source = null;
+        if (retryTimer !== null) window.clearTimeout(retryTimer);
+        retryTimer = null;
+        state.nodes = new Map();
+        state.links = [];
+        state.session = null;
+        state.agent = null;
+        panel.close();
+        setConnection("stopped");
+      }
+    } catch {
+      controlError("Could not reach the monitor.");
+    }
+    stopPending = false;
+    renderControls();
+  })();
+});
 
 const stage = h("main", { class: "stage" }, canvas.element, banner, panel.element);
 const scrim = h("div", { class: "scrim", attrs: { "aria-hidden": "true" } });
@@ -107,6 +174,7 @@ let source: EventSource | null = null;
 let retryTimer: number | null = null;
 
 function connect(): void {
+  if (state.connection === "stopped") return;
   source?.close();
   if (retryTimer !== null) window.clearTimeout(retryTimer);
   retryTimer = null;
@@ -130,6 +198,7 @@ function connect(): void {
 
 // A closed stream is either a server that restarted with a new token or one that is down.
 async function diagnoseClosed(): Promise<void> {
+  if (state.connection === "stopped") return;
   try {
     const response = await fetch("/api/snapshot");
     if (response.status === 401) {
@@ -157,7 +226,7 @@ function onSnapshot(snapshot: Snapshot): void {
   state.links = snapshot.links;
   state.health = snapshot.health;
   state.server = snapshot.server;
-  const shown = visible();
+  const shown = state.nodes;
   if (state.session === null || !shown.has(state.session)) state.session = chooseSession();
   if (state.agent !== null && !shown.has(state.agent)) state.agent = null;
   setConnection("live");
@@ -182,15 +251,15 @@ function onDelta(delta: Delta): void {
     state.links = delta.links;
   }
   if (delta.health !== null) state.health = delta.health;
-  if (state.server !== null) state.server = { ...state.server, indexing: delta.indexing };
-  if (state.session === null || !visible().has(state.session)) state.session = chooseSession();
+  if (state.server !== null) state.server = { ...state.server, indexing: delta.indexing, journal: delta.journal };
+  if (state.session === null || !state.nodes.has(state.session)) state.session = chooseSession();
   render();
   for (const id of pulses) canvas.pulse(id);
   for (const link of talks) canvas.pulseMessage(link.from, link.to);
 }
 
 function chooseSession(): AgentId | null {
-  const shown = visible();
+  const shown = state.nodes;
   if (pendingFocus !== null) {
     const focus = pendingFocus;
     if (shown.has(focus)) {
@@ -201,19 +270,6 @@ function chooseSession(): AgentId | null {
   const now = Date.now();
   const roots = rootsOf(shown, now);
   return (roots.find((root) => isLive(root, now)) ?? roots[0])?.id ?? null;
-}
-
-function setScope(scope: Scope): void {
-  state.scope = scope;
-  try {
-    localStorage.setItem(SCOPE_KEY, scope);
-  } catch {
-    // Storage is unavailable; the choice lasts for this page only.
-  }
-  const shown = visible();
-  if (state.agent !== null && !shown.has(state.agent)) selectAgent(null);
-  if (state.session === null || !shown.has(state.session)) state.session = chooseSession();
-  render();
 }
 
 // --- selection -------------------------------------------------------------
@@ -239,7 +295,7 @@ function selectAgent(id: AgentId | null): void {
     render();
     return;
   }
-  const shown = visible();
+  const shown = state.nodes;
   const node = shown.get(id);
   if (node === undefined) return;
   const root = rootOf(id, shown);
@@ -272,7 +328,7 @@ function toggleRail(open?: boolean): void {
 
 function render(): void {
   const now = Date.now();
-  const shown = visible();
+  const shown = state.nodes;
   const roots = rootsOf(shown, now);
   const descendants = new Map<AgentId, Descendants>();
   for (const node of shown.values()) {
@@ -282,13 +338,15 @@ function render(): void {
     descendants.set(root, { total: entry.total + 1, running: entry.running + (working(node, now) ? 1 : 0) });
   }
   const hours = state.server?.windowHours ?? 24;
-  rail.render(roots, descendants, state.session, now, state.scope, `Last ${hours} hours`);
+  rail.render(roots, descendants, state.session, now, `Last ${hours} hours`);
 
   const tree = state.session === null ? null : treeOf(state.session, shown);
   canvas.render(tree, state.agent, now, state.links);
   document.documentElement.dataset.harness = tree?.root.harness ?? defaultHarness;
 
-  if (state.connection === "expired") {
+  if (state.connection === "stopped") {
+    canvas.setEmpty(h("div", { class: "empty" }, logo(), h("h2", { text: "Monitor stopped" }), h("p", {}, "Run ", h("code", { text: "psf-monitor start" }), " to start it again.")));
+  } else if (state.connection === "expired") {
     canvas.setEmpty(
       h(
         "div",
@@ -299,7 +357,7 @@ function render(): void {
       ),
     );
   } else if (shown.size === 0) {
-    canvas.setEmpty(emptyState(state.server?.indexing === true, state.nodes.size > 0));
+    canvas.setEmpty(emptyState(state.server?.indexing === true));
   } else if (tree !== null && tree.nodes.length === 1) {
     canvas.setEmpty(h("p", { class: "canvas-hint", text: "No agents spawned yet." }));
   } else {
@@ -328,36 +386,28 @@ function render(): void {
       ...(messages > 0 ? [stat("messages", messages, messages === 1 ? "message" : "messages")] : []),
       stat("tokens", counts.tokens, "tokens", compactNumber(counts.tokens)),
     );
-    document.title = counts.running > 0 ? `(${counts.running}) pstack monitor` : "pstack monitor";
+    document.title = counts.running > 0 ? `(${counts.running}) psf-monitor` : "psf-monitor";
   }
 
   if (state.agent !== null) panel.update(shown, now, state.links);
   renderBanner();
   renderLive();
+  renderControls();
 }
 
 function stat(kind: string, value: number, label: string, shown = String(value)): HTMLElement {
   return h("span", { class: "stat", attrs: { "data-kind": kind, "data-zero": String(value === 0) } }, h("b", { text: shown }), h("span", { text: ` ${label}` }));
 }
 
-function emptyState(indexing: boolean, hidden: boolean): HTMLElement {
+function emptyState(indexing: boolean): HTMLElement {
   const hours = state.server?.windowHours ?? 24;
   if (indexing) return h("div", { class: "empty" }, logo(), h("h2", { text: "Reading recent transcripts…" }));
-  const scoped = state.scope === "pstack";
-  const showAll = scoped && hidden
-    ? (() => {
-        const button = h("button", { class: "empty-action", text: "Show every session", attrs: { type: "button" } });
-        button.addEventListener("click", () => setScope("all"));
-        return button;
-      })()
-    : null;
   return h(
     "div",
     { class: "empty" },
     logo(),
-    h("h2", { text: scoped ? `No pstack sessions in the last ${hours} hours` : `No sessions in the last ${hours} hours` }),
-    h("p", { text: scoped ? "Run a pstack skill in Claude Code or Codex and it appears here." : "Start a Claude Code or Codex session and it appears here." }),
-    showAll,
+    h("h2", { text: `No pstack sessions in the last ${hours} hours` }),
+    h("p", { text: "Run a pstack skill in Claude Code or Codex and it appears here." }),
   );
 }
 
@@ -387,10 +437,11 @@ function renderBanner(): void {
 }
 
 function setConnection(next: Connection): void {
+  if (state.connection === "stopped" && next !== "stopped") return;
   if (state.connection === next) return;
   const wasExpired = state.connection === "expired";
   state.connection = next;
-  if (wasExpired || next === "expired") render();
+  if (wasExpired || next === "expired" || next === "stopped") render();
   else renderLive();
 }
 
@@ -404,6 +455,7 @@ function renderLive(): void {
     indexing: "Indexing…",
     retrying: "Reconnecting…",
     expired: "Link expired",
+    stopped: "Stopped",
   }[shown];
   live.title = shown === "expired" ? "Run `psf-monitor start` and open the new link." : "";
 }
@@ -426,4 +478,5 @@ document.addEventListener("keydown", (event) => {
 
 new ResizeObserver(() => fitPanel()).observe(stage);
 
+renderControls();
 connect();

@@ -236,7 +236,7 @@ describe("activity", () => {
   });
 });
 
-describe("pstack scope", () => {
+describe("pstack visibility", () => {
   const other = "claude:s2" as AgentId;
   const otherSession: Fact = { ...session, id: other } as Fact;
 
@@ -247,11 +247,12 @@ describe("pstack scope", () => {
       { kind: "link-by-call", id: child, callId: "call-1", fallback: root },
       otherSession,
     );
-    expect(result.node(root)!.pstack).toBe(false);
+    expect(result.nodes()).toEqual([]);
+    expect(result.flush()).toBeNull();
     result.apply({ kind: "pstack", id: child });
-    expect(result.node(root)!.pstack).toBe(true);
-    expect(result.node(child)!.pstack).toBe(true);
-    expect(result.node(other)!.pstack).toBe(false);
+    expect(result.nodes().map((node) => node.id).sort()).toEqual([root, child].sort());
+    expect(result.flush()!.upserts.map((node) => node.id).sort()).toEqual([root, child].sort());
+    expect(result.nodes().some((node) => node.id === other)).toBe(false);
   });
 
   it("sends the newly marked tree in the next flush", () => {
@@ -260,6 +261,21 @@ describe("pstack scope", () => {
     result.apply({ kind: "pstack", id: root });
     const upserts = result.flush()!.upserts.map((node) => node.id).sort();
     expect(upserts).toEqual([root, child].sort());
+  });
+
+  it("makes a parent's tree visible when a linked lane carries pstack evidence", () => {
+    const lane = "lane:l1" as AgentId;
+    const result = store(
+      session,
+      subagent,
+      { kind: "agent", id: lane, patch: { harness: "claude", source: "runner-lane", flavor: { kind: "lane", mode: "read-only", stream: "live", label: null, receipt: null } } },
+      { kind: "link", id: lane, parent: root, via: "runner" },
+    );
+    expect(result.nodes()).toEqual([]);
+    expect(result.flush()).toBeNull();
+    result.apply({ kind: "pstack", id: lane });
+    expect(result.nodes().map((node) => node.id).sort()).toEqual([root, child, lane].sort());
+    expect(result.flush()!.upserts.map((node) => node.id).sort()).toEqual([root, child, lane].sort());
   });
 });
 
@@ -322,12 +338,12 @@ describe("message links", () => {
       codexMessage("m2", judge, "/root", "/root/judge"),
       codexMessage("m3", codexRoot, "/root/judge", "/root"),
       codexMessage("m4", otherJudge, "/root/judge", "/root"),
+      { kind: "pstack", id: judge },
     );
     const links = result.links().map(({ from, to, count }) => `${from} > ${to} × ${count}`);
     expect(links.sort()).toEqual([
       `${codexRoot} > ${judge} × 2`,
       `${judge} > ${codexRoot} × 1`,
-      `${otherJudge} > ${otherRoot} × 1`,
     ].sort());
   });
 
@@ -340,7 +356,7 @@ describe("message links", () => {
       to: { kind: "claude-target", session: root, target },
       at: null,
     });
-    const result = store(session, subagent, named, send("s1", root, "a1"), send("s2", root, "researcher"), send("s3", child, "main"), send("s4", root, "nobody"));
+    const result = store(session, subagent, named, send("s1", root, "a1"), send("s2", root, "researcher"), send("s3", child, "main"), send("s4", root, "nobody"), { kind: "pstack", id: child });
     expect(result.links().map(({ from, to }) => `${from} > ${to}`).sort()).toEqual([
       `${root} > ${child}`,
       `${root} > ${grandchild}`,
@@ -349,7 +365,7 @@ describe("message links", () => {
   });
 
   it("sends links with a flush only when they change", () => {
-    const result = store(...codexAgent(codexRoot, "/root", null), ...codexAgent(judge, "/root/judge", codexRoot));
+    const result = store(...codexAgent(codexRoot, "/root", null), ...codexAgent(judge, "/root/judge", codexRoot), { kind: "pstack", id: judge });
     // No links yet; the snapshot already says so.
     expect(result.flush()!.links).toBeNull();
     result.apply({ kind: "activity", id: judge, activity: { what: "text", snippet: "x", at: null } });
@@ -361,7 +377,7 @@ describe("message links", () => {
 
 describe("flush", () => {
   it("sends only nodes that changed", () => {
-    const result = store(session, subagent);
+    const result = store(session, subagent, { kind: "pstack", id: child });
     const first = result.flush()!;
     expect(first.upserts.map((node) => node.id).sort()).toEqual([root, child]);
     expect(result.flush()).toBeNull();

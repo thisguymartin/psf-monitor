@@ -72,6 +72,8 @@ describe("Index", () => {
   it("builds the agent tree from both harnesses", async () => {
     const { store, index } = setup();
     await index.refresh(true);
+    store.apply({ kind: "pstack", id: "claude:s1" as AgentId });
+    store.apply({ kind: "pstack", id: "codex:01a0aaaa-0000-7000-8000-000000000001" as AgentId });
     const nodes = new Map(store.nodes().map((node) => [node.id, node]));
     expect(nodes.get("claude:s1" as AgentId)).toMatchObject({ title: "Build the monitor", harness: "claude" });
     expect(nodes.get("claude:s1:a1" as AgentId)).toMatchObject({ parent: "claude:s1", title: "Explore", flavor: { kind: "subagent", agentType: "Explore" } });

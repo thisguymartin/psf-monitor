@@ -1,6 +1,6 @@
 import { parseArgs as parseNodeArgs } from "node:util";
 import { buildAssets } from "./assets.ts";
-import { DEFAULT_PORT, serve, start, status, stop, type Io, type Scope } from "./daemon.ts";
+import { DEFAULT_PORT, serve, start, status, stop, type Io } from "./daemon.ts";
 import { diagnose, renderReport } from "./doctor.ts";
 import type { Harness } from "./domain.ts";
 import { journalEnabled, journalOff, journalOn } from "./journal.ts";
@@ -22,7 +22,6 @@ Commands:
 Options:
   --parent <claude|codex>  The harness asking: sets the theme and focuses its session.
   --focus <session id>     Session to select first.
-  --all                    Show every session, not only pstack's.
   --port <n>               Port on 127.0.0.1 (default ${DEFAULT_PORT}).
   --hours <n>              How far back to index (default 24).
   -h, --help               Show this help.
@@ -49,7 +48,6 @@ export interface Options {
   readonly hours: number;
   readonly harness: Harness | null;
   readonly focus: string | null;
-  readonly scope: Scope;
 }
 
 function positiveNumber(name: string, value: unknown, fallback: number): number {
@@ -77,7 +75,6 @@ export function parseArgs(argv: readonly string[], env: NodeJS.ProcessEnv = proc
         focus: { type: "string" },
         port: { type: "string" },
         hours: { type: "string" },
-        all: { type: "boolean", default: false },
         help: { type: "boolean", short: "h", default: false },
       },
     });
@@ -96,16 +93,15 @@ export function parseArgs(argv: readonly string[], env: NodeJS.ProcessEnv = proc
   const focusValue = typeof parsed.values.focus === "string" && parsed.values.focus.length > 0 ? parsed.values.focus : null;
   const session = focusValue ?? currentSession(harness, env);
   const focus = session === null || harness === null || session.includes(":") ? session : `${harness}:${session}`;
-  const scope: Scope = parsed.values.all === true ? "all" : "pstack";
   if (parsed.values.help === true || command === undefined || command === "help") {
-    return { command: "help", journal: "status", port, hours, harness, focus, scope };
+    return { command: "help", journal: "status", port, hours, harness, focus };
   }
   if (!(COMMANDS as readonly string[]).includes(command)) throw new UsageError(`unknown command: ${command}`);
   const action = parsed.positionals[1] ?? "status";
   if (command === "journal" && !(JOURNAL_ACTIONS as readonly string[]).includes(action)) {
     throw new UsageError("journal takes on, off, or status");
   }
-  return { command: command as Command, journal: action as JournalAction, port, hours, harness, focus, scope };
+  return { command: command as Command, journal: action as JournalAction, port, hours, harness, focus };
 }
 
 function journal(where: Homes, action: JournalAction, io: Io): number {
@@ -143,9 +139,9 @@ export async function main(
       io.stdout(HELP);
       return 0;
     case "start":
-      return start(where, { port: options.port, windowHours: options.hours, harness: options.harness, focus: options.focus, scope: options.scope }, io);
+      return start(where, { port: options.port, windowHours: options.hours, harness: options.harness, focus: options.focus }, io);
     case "status":
-      return status(where, io, options.scope);
+      return status(where, io);
     case "stop":
       return stop(where, io);
     case "journal":

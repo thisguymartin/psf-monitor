@@ -4,6 +4,7 @@ import { closeSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentNode, Harness } from "./domain.ts";
+import { cancelLane } from "./control.ts";
 import { diskFileSystem } from "./fs.ts";
 import { journalOn, pruneLanes } from "./journal.ts";
 import { Monitor } from "./monitor.ts";
@@ -32,14 +33,11 @@ export interface ServeOptions {
   readonly assets: () => Promise<Assets>;
 }
 
-export type Scope = "pstack" | "all";
-
 export interface StartOptions {
   readonly port: number;
   readonly windowHours: number;
   readonly harness: Harness | null;
   readonly focus: string | null;
-  readonly scope: Scope;
 }
 
 interface Health {
@@ -73,11 +71,10 @@ async function waitForExit(pid: number): Promise<void> {
   while (processExists(pid)) await Bun.sleep(POLL_INTERVAL_MS);
 }
 
-export function launchUrl(record: ServerRecord, harness: Harness | null, focus: string | null, scope: Scope = "pstack"): string {
+export function launchUrl(record: ServerRecord, harness: Harness | null, focus: string | null): string {
   const query = new URLSearchParams({ token: record.token });
   if (harness !== null) query.set("harness", harness);
   if (focus !== null) query.set("focus", focus);
-  if (scope === "all") query.set("all", "1");
   return `${serverUrl(record)}/?${query.toString()}`;
 }
 
@@ -104,8 +101,18 @@ export async function serve(where: Homes, options: ServeOptions, io: Io): Promis
     windowHours: options.windowHours,
     version,
     instance,
+    lanes: where.lanes,
   });
-  const handler = createHandler(monitor, { port: options.port, token, assets: await options.assets() });
+  let resolveStopped: () => void = () => {};
+  const stopped = new Promise<void>((resolve) => { resolveStopped = resolve; });
+  const handler = createHandler(monitor, {
+    port: options.port,
+    token,
+    assets: await options.assets(),
+    lanes: where.lanes,
+    cancel: (id) => cancelLane(monitor.store, psTable, id),
+    stop: resolveStopped,
+  });
   let server: ReturnType<typeof Bun.serve>;
   try {
     server = Bun.serve({ hostname: "127.0.0.1", port: options.port, fetch: (request, bun) => handler(request, bun) });
@@ -122,10 +129,8 @@ export async function serve(where: Homes, options: ServeOptions, io: Io): Promis
     startedAt: new Date().toISOString(),
   });
   io.stdout(`psf-monitor ${version} serving ${serverUrl({ port: options.port })}\n`);
-  const stopped = new Promise<void>((resolve) => {
-    process.once("SIGTERM", () => resolve());
-    process.once("SIGINT", () => resolve());
-  });
+  process.once("SIGTERM", resolveStopped);
+  process.once("SIGINT", resolveStopped);
   await monitor.start();
   await stopped;
   monitor.stop();
@@ -149,7 +154,7 @@ export async function start(where: Homes, options: StartOptions, io: Io): Promis
     const running = await health(existing.port);
     if (running?.instance === existing.instance) {
       if (running.version === version) {
-        io.stdout(`${launchUrl(existing, options.harness, options.focus, options.scope)}\n`);
+        io.stdout(`${launchUrl(existing, options.harness, options.focus)}\n`);
         return 0;
       }
       io.stderr(`replacing psf-monitor ${running.version} with ${version}\n`);
@@ -182,7 +187,7 @@ export async function start(where: Homes, options: StartOptions, io: Io): Promis
     }
     const record = readRecord(where.state);
     if (record !== null && record.pid === child.pid && (await health(record.port))?.instance === record.instance) {
-      io.stdout(`${launchUrl(record, options.harness, options.focus, options.scope)}\n`);
+      io.stdout(`${launchUrl(record, options.harness, options.focus)}\n`);
       return 0;
     }
     await Bun.sleep(POLL_INTERVAL_MS);
@@ -218,7 +223,7 @@ export function summarize(agents: readonly AgentNode[]): string {
   return parts.join(" · ");
 }
 
-export async function status(where: Homes, io: Io, scope: Scope = "pstack"): Promise<number> {
+export async function status(where: Homes, io: Io): Promise<number> {
   const record = readRecord(where.state);
   const running = record === null ? null : await health(record.port);
   if (record === null || running?.instance !== record.instance) {
@@ -231,8 +236,7 @@ export async function status(where: Homes, io: Io, scope: Scope = "pstack"): Pro
     });
     const snapshot = (await response.json()) as Snapshot;
     const indexing = snapshot.server.indexing ? " · indexing" : "";
-    const agents = snapshot.agents.filter((agent) => scope === "all" || agent.pstack);
-    io.stdout(`psf-monitor ${running.version} · ${summarize(agents)}${indexing}\n${launchUrl(record, null, null, scope)}\n`);
+    io.stdout(`psf-monitor ${running.version} · ${summarize(snapshot.agents)}${indexing}\n${launchUrl(record, null, null)}\n`);
     return 0;
   } catch (error) {
     io.stderr(`psf-monitor did not answer: ${error instanceof Error ? error.message : String(error)}\n`);

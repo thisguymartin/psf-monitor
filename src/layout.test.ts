@@ -28,7 +28,6 @@ function node(id: string, parent: string | null, status: AgentStatus["kind"] = "
     startedAt,
     lastActivityAt: startedAt,
     activity: null,
-    pstack: false,
     prompt: null,
     pending: null,
     usage: { inputTokens: 10, outputTokens: 5 },

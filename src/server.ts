@@ -1,13 +1,16 @@
 import { timingSafeEqual } from "node:crypto";
+import { AGENT_ACTIONS } from "./actions.ts";
+import type { CancelResult } from "./control.ts";
 import type { AgentId } from "./domain.ts";
+import { journalEnabled, journalOff, journalOn } from "./journal.ts";
 import { FIRST_PAGE, type Monitor } from "./monitor.ts";
 import type { ServerEvent } from "./wire.ts";
 
-// The monitor's HTTP surface. Read-only, loopback only,
-// and every route but the health check requires the per-start token.
+// The monitor's HTTP surface. Loopback only, with a per-start token.
 
 const MAX_PAGE = 400;
 const MAX_ID = 300;
+const MAX_BODY = 4 * 1024;
 
 export interface Assets {
   readonly html: string;
@@ -19,6 +22,9 @@ export interface HandlerOptions {
   readonly port: number;
   readonly token: string;
   readonly assets: Assets;
+  readonly lanes: string;
+  readonly cancel: (id: AgentId) => Promise<CancelResult>;
+  readonly stop: () => void;
 }
 
 /** The subset of Bun's server the handler uses; absent in tests. */
@@ -72,6 +78,22 @@ function cursorParam(value: string | null): number | null {
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
 }
 
+// Runs only after the token check, so the body comes from the page itself.
+async function readJson(request: Request): Promise<unknown> {
+  if (request.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() !== "application/json") throw new Error("Content-Type must be application/json.");
+  const body = await request.text();
+  if (body.length > MAX_BODY) throw new Error("Request body is too large.");
+  try {
+    return JSON.parse(body) as unknown;
+  } catch {
+    throw new Error("Invalid JSON body.");
+  }
+}
+
+function object(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 export function createHandler(monitor: Monitor, options: HandlerOptions) {
   const hosts = new Set([`127.0.0.1:${options.port}`, `localhost:${options.port}`]);
   const origins = new Set([...hosts].map((host) => `http://${host}`));
@@ -89,15 +111,15 @@ export function createHandler(monitor: Monitor, options: HandlerOptions) {
     if (!hosts.has(request.headers.get("host") ?? "")) return plain(403, "forbidden host");
     const origin = request.headers.get("origin");
     if (origin !== null && !origins.has(origin)) return plain(403, "forbidden origin");
-    if (request.method !== "GET" && request.method !== "HEAD") return plain(405, "read-only");
+    if (request.method !== "GET" && request.method !== "POST") return plain(405, "method not allowed");
 
     const url = new URL(request.url);
-    if (url.pathname === "/api/health") {
+    if (request.method === "GET" && url.pathname === "/api/health") {
       const info = monitor.info();
       return json({ app: info.app, version: info.version, instance: info.instance, pid: info.pid });
     }
 
-    if (url.pathname === "/" && url.searchParams.has("token")) {
+    if (request.method === "GET" && url.pathname === "/" && url.searchParams.has("token")) {
       if (!sameSecret(url.searchParams.get("token") ?? "", options.token)) return plain(401, "invalid token");
       url.searchParams.delete("token");
       const query = url.searchParams.toString();
@@ -109,6 +131,51 @@ export function createHandler(monitor: Monitor, options: HandlerOptions) {
 
     if (!authorized(request)) {
       return plain(401, "Open the link printed by `psf-monitor start`; it carries this server's access token.");
+    }
+
+    if (request.method === "POST") {
+      if (!origins.has(origin ?? "")) return plain(403, "origin required");
+      if (url.pathname !== "/api/action" && url.pathname !== "/api/journal" && url.pathname !== "/api/stop") return plain(405, "method not allowed");
+      let body: unknown;
+      try {
+        body = await readJson(request);
+      } catch (error) {
+        return json({ ok: false, message: error instanceof Error ? error.message : "Invalid request." }, 400);
+      }
+      if (url.pathname === "/api/action") {
+        if (!object(body) || typeof body.agent !== "string" || agentParam(body.agent) === null || typeof body.action !== "string") {
+          return json({ ok: false, message: "Expected agent and action." }, 400);
+        }
+        const action = AGENT_ACTIONS.find((item) => item.id === body.action && item.runs === "server");
+        if (action === undefined) return json({ ok: false, message: "Unknown server action." }, 400);
+        switch (action.id) {
+          case "cancel": {
+            const result = await options.cancel(body.agent as AgentId);
+            switch (result.kind) {
+              case "sent": return json({ ok: true, message: "Cancellation sent." });
+              case "unknown-agent": return json({ ok: false, message: "Unknown agent." }, 404);
+              case "process-gone": return json({ ok: false, message: "Lane runner is no longer running." }, 409);
+              case "not-cancellable": return json({ ok: false, message: result.reason }, 409);
+            }
+          }
+          case "copy-resume":
+            return json({ ok: false, message: "Unknown server action." }, 400);
+        }
+      }
+      if (url.pathname === "/api/journal") {
+        if (!object(body) || typeof body.on !== "boolean") return json({ ok: false, message: "Expected on: boolean." }, 400);
+        try {
+          const change = body.on ? journalOn(options.lanes) : journalOff(options.lanes);
+          return json({ ok: true, journal: journalEnabled(options.lanes), message: change === "enabled" ? "Lane journal on." : change === "disabled" ? "Lane journal off; recorded lanes deleted." : body.on ? "Lane journal is already on." : "Lane journal is already off." });
+        } catch {
+          return json({ ok: false, message: "Could not change lane journal." }, 500);
+        }
+      }
+      if (!object(body)) return json({ ok: false, message: "Expected JSON object." }, 400);
+      const response = json({ ok: true });
+      // Let Bun write the reply before serve() closes its listener.
+      setTimeout(options.stop, 25);
+      return response;
     }
 
     switch (url.pathname) {
@@ -133,6 +200,10 @@ export function createHandler(monitor: Monitor, options: HandlerOptions) {
       }
       case "/api/events":
         return events(monitor, agentParam(url.searchParams.get("watch")), request, server);
+      case "/api/action":
+      case "/api/journal":
+      case "/api/stop":
+        return plain(405, "method not allowed");
       default:
         return plain(404, "not found");
     }

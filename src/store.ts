@@ -482,7 +482,7 @@ export class Store implements StatusView {
     for (const message of this.messages.values()) {
       const from = this.resolve(message.from, codexPaths);
       const to = this.resolve(message.to, codexPaths);
-      if (from === null || to === null || from === to) continue;
+      if (from === null || to === null || from === to || !this.isPstack(from) || !this.isPstack(to)) continue;
       const key = `${from}>${to}`;
       const pair = pairs.get(key) ?? { from, to, count: 0, lastAt: null };
       pair.count += 1;
@@ -515,7 +515,6 @@ export class Store implements StatusView {
       startedAt: agent.startedAt,
       lastActivityAt: agent.lastActivityAt,
       activity: agent.activity,
-      pstack: this.isPstack(id),
       prompt: agent.prompt,
       pending: [...agent.openCalls.values()].at(-1) ?? null,
       usage: agent.usageTotal ?? sumUsage(agent.usageByKey.values()),
@@ -524,7 +523,8 @@ export class Store implements StatusView {
   }
 
   /** True when any agent in the same spawn tree carries pstack evidence. */
-  private isPstack(id: AgentId): boolean {
+  isPstack(id: AgentId): boolean {
+    if (!this.agents.has(id)) return false;
     if (this.pstackRoots === null) {
       this.pstackRoots = new Set();
       for (const agent of this.agents.values()) if (agent.pstack) this.pstackRoots.add(this.treeRoot(agent.id));
@@ -535,6 +535,7 @@ export class Store implements StatusView {
   nodes(): AgentNode[] {
     const result: AgentNode[] = [];
     for (const id of this.agents.keys()) {
+      if (!this.isPstack(id)) continue;
       const node = this.node(id);
       if (node !== null) result.push(node);
     }

@@ -1,4 +1,4 @@
-/* pstack monitor: a night control room for agent work.
+/* psf-monitor: a night control room for agent work.
    The harness that owns the selected session sets the light: warm terracotta
    for Claude Code, cool signal blue for Codex. */
 
@@ -268,6 +268,23 @@ code {
   color: var(--text-2);
 }
 
+.bar-controls { display: flex; align-items: center; gap: 6px; flex: none; }
+.quiet-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--text-2);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.quiet-action:hover:not(:disabled) { color: var(--text); border-color: var(--line-strong); background: var(--layer-2); }
+.quiet-action .icon { width: 13px; height: 13px; }
+.bar-command-message { color: var(--failed); font-size: 11.5px; }
+.bar-command-message[hidden] { display: none; }
+
 .stat b {
   color: var(--text);
   font-weight: 650;
@@ -327,15 +344,6 @@ code {
 .rail-names { display: flex; align-items: center; gap: 8px; }
 .rail-title { font-size: 12.5px; font-weight: 650; }
 
-.rail-scope {
-  padding: 3px 9px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  color: var(--text-2);
-  font-size: 11.5px;
-  transition: color 0.15s, border-color 0.15s;
-}
-.rail-scope:hover { color: var(--text); border-color: var(--line-strong); }
 .rail-group[hidden] { display: none; }
 
 .rail-count {
@@ -901,16 +909,6 @@ code {
 .empty .logo { width: 52px; height: 52px; margin-bottom: 6px; }
 .empty h2 { margin: 0; font-size: 17px; font-weight: 650; letter-spacing: -0.01em; text-wrap: balance; }
 .empty p { margin: 0; font-size: 13.5px; line-height: 1.55; color: var(--text-2); text-wrap: pretty; }
-.empty-action {
-  margin-top: 4px;
-  padding: 6px 14px;
-  border: 1px solid var(--line-strong);
-  border-radius: 999px;
-  font-size: 12.5px;
-  font-weight: 550;
-}
-.empty-action:hover { border-color: var(--accent); color: var(--accent-strong); }
-
 .canvas-hint {
   max-width: 420px;
   margin: 0;
@@ -1053,6 +1051,11 @@ code {
   align-items: start;
   gap: 12px;
 }
+
+.panel-command-bar { display: flex; flex-wrap: wrap; gap: 6px; }
+.panel-command-bar[hidden] { display: none; }
+.command-message { margin: 0; color: var(--failed); font-size: 12px; }
+.command-message[hidden] { display: none; }
 
 .panel-glyph {
   width: 40px;
@@ -1470,6 +1473,7 @@ code {
 
 @media (max-width: 1100px) {
   .bar-path { display: none; }
+  .bar-stats .stat:not([data-kind="running"]):not([data-kind="spawned"]) { display: none; }
 }
 
 @media (max-width: 860px) {
@@ -1516,4 +1520,7 @@ code {
   .live-text { display: none; }
   .bar-session { border-left: 0; padding-left: 0; }
   .live { padding: 7px; }
+  .bar-controls { gap: 2px; }
+  .bar-controls .quiet-action { padding: 5px; }
+  .bar-controls .quiet-action .icon { display: none; }
 }

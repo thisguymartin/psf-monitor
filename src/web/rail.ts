@@ -4,11 +4,8 @@ import { h, icon, providerIcon } from "./dom.ts";
 
 // The session list, grouped by whether anyone is working.
 
-export type Scope = "pstack" | "all";
-
 export interface RailEvents {
   select(root: AgentId): void;
-  toggleScope(): void;
 }
 
 export interface Descendants {
@@ -50,15 +47,12 @@ export class Rail {
   private readonly groups = new Map<Group, HTMLElement>();
   private readonly title: HTMLElement;
   private readonly count: HTMLElement;
-  private readonly scopeButton: HTMLButtonElement;
   private readonly foot: HTMLElement;
   private readonly empty: HTMLElement;
 
   constructor(private readonly events: RailEvents) {
     this.title = h("span", { class: "rail-title" });
     this.count = h("span", { class: "rail-count" });
-    this.scopeButton = h("button", { class: "rail-scope", attrs: { type: "button" } });
-    this.scopeButton.addEventListener("click", () => this.events.toggleScope());
     const sections = GROUPS.map(({ key, label }) => {
       const list = h("ul", { class: "sessions" });
       const section = h("section", { class: "rail-group", attrs: { "data-group": key } }, h("h2", { class: "rail-heading", text: label }), list);
@@ -71,7 +65,7 @@ export class Rail {
     this.element = h(
       "nav",
       { class: "rail", attrs: { "aria-label": "Sessions" } },
-      h("header", { class: "rail-head" }, h("span", { class: "rail-names" }, this.title, this.count), this.scopeButton),
+      h("header", { class: "rail-head" }, h("span", { class: "rail-names" }, this.title, this.count)),
       h("div", { class: "rail-scroll" }, ...sections, this.empty),
       this.foot,
     );
@@ -82,7 +76,6 @@ export class Rail {
     descendants: ReadonlyMap<AgentId, Descendants>,
     selected: AgentId | null,
     now: number,
-    scope: Scope,
     footer: string,
   ): void {
     const rows = new Map<Group, HTMLElement[]>(GROUPS.map(({ key }) => [key, []]));
@@ -96,10 +89,8 @@ export class Rail {
       this.lists.get(key)!.replaceChildren(...items);
       this.groups.get(key)!.hidden = items.length === 0;
     }
-    this.title.textContent = scope === "pstack" ? "pstack sessions" : "All sessions";
-    this.scopeButton.textContent = scope === "pstack" ? "Show all" : "pstack only";
-    this.scopeButton.setAttribute("aria-pressed", String(scope === "all"));
-    this.empty.textContent = scope === "pstack" ? "No pstack sessions yet." : "No sessions yet.";
+    this.title.textContent = "pstack sessions";
+    this.empty.textContent = "No pstack sessions yet.";
     this.empty.hidden = roots.length > 0;
     this.count.textContent = String(roots.length);
     this.foot.textContent = footer;

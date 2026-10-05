@@ -1,4 +1,5 @@
 import type { AgentId, AgentNode, Health, MessageLink, SourceKind, TimelineItem } from "./domain.ts";
+import type { AgentActionId } from "./actions.ts";
 
 // The JSON shapes the server sends the browser.
 
@@ -27,6 +28,7 @@ export interface ServerInfo {
   readonly watching: "events" | "poll";
   readonly indexing: boolean;
   readonly windowHours: number;
+  readonly journal: boolean;
 }
 
 export interface Snapshot {
@@ -44,7 +46,22 @@ export interface Delta {
   readonly links: readonly MessageLink[] | null;
   readonly health: readonly SourceHealth[] | null;
   readonly indexing: boolean;
+  readonly journal: boolean;
 }
+
+export interface ActionRequest {
+  readonly agent: string;
+  readonly action: AgentActionId;
+}
+
+export interface ActionResponse {
+  readonly ok: boolean;
+  readonly message: string;
+}
+
+export interface JournalRequest { readonly on: boolean }
+export interface JournalResponse extends ActionResponse { readonly journal: boolean }
+export interface StopResponse { readonly ok: true }
 
 export interface TimelinePage {
   readonly agent: AgentId;

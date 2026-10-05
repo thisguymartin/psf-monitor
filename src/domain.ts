@@ -81,8 +81,6 @@ export interface AgentNode {
   readonly startedAt: string | null;
   readonly lastActivityAt: string | null;
   readonly activity: Activity | null;
-  /** True when any agent in this node's spawn tree is pstack work. */
-  readonly pstack: boolean;
   readonly prompt: Prompt | null;
   readonly pending: PendingCall | null;
   readonly usage: NormalizedUsage | null;

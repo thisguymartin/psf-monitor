@@ -4,6 +4,7 @@ import type { Adapter } from "./adapter.ts";
 import type { AgentId, TimelineItem } from "./domain.ts";
 import type { FileSystem } from "./fs.ts";
 import { Index } from "./index.ts";
+import { journalEnabled } from "./journal.ts";
 import { alive, type ProcessTable } from "./probe.ts";
 import { Store } from "./store.ts";
 import type { ServerEvent, ServerInfo, Snapshot, SourceHealth, TimelinePage } from "./wire.ts";
@@ -31,6 +32,7 @@ export interface MonitorOptions {
   readonly windowHours: number;
   readonly version: string;
   readonly instance: string;
+  readonly lanes: string;
   readonly now?: () => number;
 }
 
@@ -43,12 +45,14 @@ export class Monitor {
   private readonly pendingHints = new Set<string>();
   private hintTimer: ReturnType<typeof setTimeout> | null = null;
   private lastHealth = "";
+  private lastJournal: boolean;
   private watching: ServerInfo["watching"] = "poll";
   private readonly startedAt: string;
 
   constructor(private readonly options: MonitorOptions) {
     const now = options.now ?? Date.now;
     this.startedAt = new Date(now()).toISOString();
+    this.lastJournal = journalEnabled(options.lanes);
     this.index = new Index(options.adapters, this.store, options.fs, {
       sinceMs: now() - options.windowHours * 3_600_000,
       watched: (agent) => this.isWatched(agent),
@@ -67,6 +71,7 @@ export class Monitor {
       watching: this.watching,
       indexing: this.index.isIndexing,
       windowHours: this.options.windowHours,
+      journal: journalEnabled(this.options.lanes),
     };
   }
 
@@ -85,7 +90,7 @@ export class Monitor {
   }
 
   timeline(agent: AgentId, before: number | null, limit: number): TimelinePage | null {
-    return this.index.timeline(agent, before, limit);
+    return this.store.isPstack(agent) ? this.index.timeline(agent, before, limit) : null;
   }
 
   /** Indexes the window, probes processes once, then keeps everything current. */
@@ -114,7 +119,7 @@ export class Monitor {
     this.subscribers.add(subscriber);
     subscriber.send({ event: "snapshot", data: this.snapshot() });
     if (subscriber.watch !== null) {
-      const page = this.index.timeline(subscriber.watch, null, FIRST_PAGE);
+      const page = this.timeline(subscriber.watch, null, FIRST_PAGE);
       if (page !== null) subscriber.send({ event: "timeline", data: page });
     }
     return () => {
@@ -140,7 +145,10 @@ export class Monitor {
     const serializedHealth = JSON.stringify(health);
     const healthChanged = serializedHealth !== this.lastHealth;
     this.lastHealth = serializedHealth;
-    if (changes === null && !healthChanged) return;
+    const journal = journalEnabled(this.options.lanes);
+    const journalChanged = journal !== this.lastJournal;
+    this.lastJournal = journal;
+    if (changes === null && !healthChanged && !journalChanged) return;
     this.broadcast({
       event: "delta",
       data: {
@@ -149,13 +157,14 @@ export class Monitor {
         links: changes?.links ?? null,
         health: healthChanged ? health : null,
         indexing: this.index.isIndexing,
+        journal,
       },
     });
   }
 
   private append(agent: AgentId, items: readonly TimelineItem[]): void {
     for (const subscriber of this.subscribers) {
-      if (subscriber.watch === agent) this.deliver(subscriber, { event: "append", data: { agent, items } });
+      if (subscriber.watch === agent && this.store.isPstack(agent)) this.deliver(subscriber, { event: "append", data: { agent, items } });
     }
   }
 
@@ -182,7 +191,7 @@ export class Monitor {
   }
 
   private isWatched(agent: AgentId): boolean {
-    for (const subscriber of this.subscribers) if (subscriber.watch === agent) return true;
+    for (const subscriber of this.subscribers) if (subscriber.watch === agent && this.store.isPstack(agent)) return true;
     return false;
   }
 

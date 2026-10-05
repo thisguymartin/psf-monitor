@@ -1,12 +1,14 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { claudeAdapter } from "./adapters/claude.ts";
+import type { AgentId } from "./domain.ts";
 import { parseArgs } from "./cli.ts";
 import { launchUrl, summarize } from "./daemon.ts";
 import { diskFileSystem } from "./fs.ts";
 import { Monitor } from "./monitor.ts";
+import { cancelLane } from "./control.ts";
 import { createHandler } from "./server.ts";
 import type { Snapshot, TimelinePage } from "./wire.ts";
 
@@ -23,6 +25,18 @@ function request(path: string, headers: Record<string, string> = {}, method = "G
   });
 }
 
+function post(path: string, body: unknown, headers: Record<string, string> = {}): Request {
+  return new Request(`http://127.0.0.1:${PORT}${path}`, {
+    method: "POST",
+    headers: { host: `127.0.0.1:${PORT}`, origin: `http://127.0.0.1:${PORT}`, "content-type": "application/json", ...authed, ...headers },
+    body: JSON.stringify(body),
+  });
+}
+
+function commandHandler(cancel: (id: AgentId) => Promise<import("./control.ts").CancelResult>, stop: () => void = () => {}) {
+  return createHandler(monitor, { port: PORT, token: TOKEN, assets: { html: "", css: "", js: "" }, lanes: join(scratch, "lanes"), cancel, stop });
+}
+
 const authed = { authorization: `Bearer ${TOKEN}` };
 
 beforeAll(async () => {
@@ -34,6 +48,7 @@ beforeAll(async () => {
     { type: "user", sessionId: "s1", cwd: "/repo", entrypoint: "cli", timestamp: at, message: { role: "user", content: "hello" } },
     { type: "assistant", sessionId: "s1", cwd: "/repo", timestamp: at, message: { id: "m1", content: [{ type: "text", text: "hi there" }] } },
   ].map((record) => `${JSON.stringify(record)}\n`).join(""));
+  writeFileSync(join(projects, "s2.jsonl"), `${JSON.stringify({ type: "user", sessionId: "s2", cwd: "/repo", entrypoint: "cli", timestamp: at, message: { role: "user", content: "ordinary work" } })}\n`);
   monitor = new Monitor({
     adapters: [claudeAdapter(scratch)],
     fs: diskFileSystem,
@@ -41,9 +56,11 @@ beforeAll(async () => {
     windowHours: 24,
     version: "test",
     instance: "instance-1",
+    lanes: join(scratch, "lanes"),
   });
   await monitor.start();
-  handle = createHandler(monitor, { port: PORT, token: TOKEN, assets: { html: "<!doctype html>", css: "", js: "" } });
+  monitor.store.apply({ kind: "pstack", id: "claude:s1" as never });
+  handle = createHandler(monitor, { port: PORT, token: TOKEN, assets: { html: "<!doctype html>", css: "", js: "" }, lanes: join(scratch, "lanes"), cancel: async () => ({ kind: "unknown-agent" }), stop: () => {} });
 });
 
 afterAll(() => {
@@ -71,8 +88,12 @@ describe("access control", () => {
     expect((await handle(request("/api/snapshot", { ...authed, origin: `http://localhost:${PORT}` }))).status).toBe(200);
   });
 
-  it("is read-only", async () => {
-    expect((await handle(request("/api/snapshot", authed, "POST"))).status).toBe(405);
+  it("allows POST only on command routes", async () => {
+    expect((await handle(post("/api/snapshot", {}))).status).toBe(405);
+    expect((await handle(request("/api/action", authed))).status).toBe(405);
+    expect((await handle(request("/api/health", {}, "POST"))).status).toBe(401);
+    expect((await handle(post("/api/health", {}))).status).toBe(405);
+    expect((await handle(post(`/?token=${TOKEN}`, {}))).status).toBe(405);
   });
 
   it("trades the link's token for a strict cookie and drops it from the URL", async () => {
@@ -90,7 +111,7 @@ describe("access control", () => {
   });
 
   it("themes the first paint from the link and accepts only known harnesses", async () => {
-    const themed = createHandler(monitor, { port: PORT, token: TOKEN, assets: { html: '<html data-harness="claude">', css: "", js: "" } });
+    const themed = createHandler(monitor, { port: PORT, token: TOKEN, assets: { html: '<html data-harness="claude">', css: "", js: "" }, lanes: join(scratch, "lanes"), cancel: async () => ({ kind: "unknown-agent" }), stop: () => {} });
     expect(await (await themed(request("/?harness=codex", authed))).text()).toBe('<html data-harness="codex">');
     expect(await (await themed(request('/?harness="><script>', authed))).text()).toBe('<html data-harness="claude">');
   });
@@ -101,6 +122,7 @@ describe("data", () => {
     const snapshot = (await (await handle(request("/api/snapshot", authed))).json()) as Snapshot;
     expect(snapshot.server).toMatchObject({ app: "psf-monitor", indexing: false });
     expect(snapshot.agents.map((agent) => agent.id)).toEqual(["claude:s1"] as never);
+    expect((await handle(request("/api/timeline?agent=claude:s2", authed))).status).toBe(404);
   });
 
   it("serves timelines by agent id only", async () => {
@@ -125,6 +147,13 @@ describe("data", () => {
     await reader.cancel();
     expect(text.indexOf("event: snapshot")).toBeLessThan(text.indexOf("event: timeline"));
   });
+
+  it("does not stream a hidden agent's timeline", () => {
+    const events: string[] = [];
+    const unsubscribe = monitor.subscribe({ watch: "claude:s2" as AgentId, send: (event) => events.push(event.event), ping: () => {} });
+    expect(events).toEqual(["snapshot"]);
+    unsubscribe();
+  });
 });
 
 describe("launcher", () => {
@@ -134,19 +163,100 @@ describe("launcher", () => {
     expect(parseArgs(["start"], { CLAUDE_CODE_SESSION_ID: "abc" })).toMatchObject({ harness: null, focus: null });
     expect(() => parseArgs(["start", "--parent", "cursor"], {})).toThrow("--parent");
     expect(() => parseArgs(["start", "--port", "99999"], {})).toThrow("--port");
-    expect(parseArgs(["start"], {})).toMatchObject({ scope: "pstack" });
-    expect(parseArgs(["start", "--all"], {})).toMatchObject({ scope: "all" });
+    expect(() => parseArgs(["start", "--all"], {})).toThrow();
   });
 
   it("builds a link that carries the token, theme, and focus", () => {
     const url = launchUrl({ pid: 1, port: 47317, token: "t", version: "v", instance: "i", startedAt: "s" }, "codex", "codex:t1");
     expect(url).toBe("http://127.0.0.1:47317/?token=t&harness=codex&focus=codex%3At1");
-    const all = launchUrl({ pid: 1, port: 47317, token: "t", version: "v", instance: "i", startedAt: "s" }, null, null, "all");
-    expect(all).toBe("http://127.0.0.1:47317/?token=t&all=1");
   });
 
   it("summarizes agent counts in a stable order", () => {
     const node = (kind: "running" | "done") => ({ status: kind === "running" ? { kind, evidence: "pid" } : { kind, at: null } }) as never;
     expect(summarize([node("done"), node("running"), node("running")])).toBe("3 agents · 2 running · 1 done");
+  });
+});
+
+describe("commands", () => {
+  it("rejects unauthenticated, cross-origin, non-JSON, and oversized requests before control", async () => {
+    let calls = 0;
+    const handler = commandHandler(async () => { calls += 1; return { kind: "sent" }; });
+    const body = { agent: "lane:l1", action: "cancel" };
+    const noOrigin = post("/api/action", body);
+    noOrigin.headers.delete("origin");
+    expect((await handler(noOrigin)).status).toBe(403);
+    expect((await handler(post("/api/action", body, { origin: "http://evil.example" }))).status).toBe(403);
+    expect((await handler(post("/api/action", body, { authorization: "" }))).status).toBe(401);
+    expect((await handler(post("/api/action", body, { host: "evil.example" }))).status).toBe(403);
+    expect((await handler(post("/api/action", body, { "content-type": "" }))).status).toBe(400);
+    expect((await handler(post("/api/action", body, { "content-type": "text/plain" }))).status).toBe(400);
+    expect((await handler(post("/api/action", { ...body, padding: "x".repeat(4_100) }))).status).toBe(400);
+    expect((await handler(new Request(`http://127.0.0.1:${PORT}/api/action`, { method: "POST", headers: { host: `127.0.0.1:${PORT}`, origin: `http://127.0.0.1:${PORT}`, ...authed, "content-type": "application/json" }, body: "{" }))).status).toBe(400);
+    expect((await handler(post("/api/action", { agent: "lane:l1", action: "copy-resume" }))).status).toBe(400);
+    expect(calls).toBe(0);
+  });
+
+  it("rejects unsafe journal and stop requests without changing state", async () => {
+    let stops = 0;
+    const handler = commandHandler(async () => ({ kind: "unknown-agent" }), () => { stops += 1; });
+    const journal = post("/api/journal", { on: true });
+    journal.headers.delete("origin");
+    expect((await handler(journal)).status).toBe(403);
+    const stop = post("/api/stop", {});
+    stop.headers.delete("origin");
+    expect((await handler(stop)).status).toBe(403);
+    expect(existsSync(join(scratch, "lanes"))).toBe(false);
+    await Bun.sleep(30);
+    expect(stops).toBe(0);
+  });
+
+  it("routes cancel and maps unknown and unavailable lanes", async () => {
+    const seen: AgentId[] = [];
+    const handler = commandHandler(async (id) => {
+      seen.push(id);
+      return id === "lane:running" ? { kind: "sent" } : id === "lane:unknown" ? { kind: "unknown-agent" } : { kind: "not-cancellable", reason: "Lane is not running." };
+    });
+    expect(await (await handler(post("/api/action", { agent: "lane:running", action: "cancel" }))).json()).toEqual({ ok: true, message: "Cancellation sent." });
+    expect((await handler(post("/api/action", { agent: "lane:unknown", action: "cancel" }))).status).toBe(404);
+    expect((await handler(post("/api/action", { agent: "lane:done", action: "cancel" }))).status).toBe(409);
+    expect(seen).toEqual(["lane:running", "lane:unknown", "lane:done"] as never);
+  });
+
+  it("uses the current lane status for a non-running lane", async () => {
+    const id = "lane:finished" as AgentId;
+    monitor.store.apply({ kind: "agent", id, patch: { harness: "claude", source: "runner-lane", flavor: { kind: "lane", mode: "read-only", stream: "live", label: null, receipt: null } } });
+    monitor.store.apply({ kind: "pstack", id });
+    monitor.store.apply({ kind: "outcome", id, outcome: "done", at: null, reason: null });
+    const handler = commandHandler((agent) => cancelLane(monitor.store, async () => new Map(), agent, () => { throw new Error("must not signal"); }));
+    expect((await handler(post("/api/action", { agent: id, action: "cancel" }))).status).toBe(409);
+  });
+
+  it("toggles the journal directory and publishes journal state", async () => {
+    const lanes = join(scratch, "lanes");
+    const deltas: boolean[] = [];
+    const unsubscribe = monitor.subscribe({ watch: null, send: (event) => { if (event.event === "delta") deltas.push(event.data.journal); }, ping: () => {} });
+    const on = await handle(post("/api/journal", { on: true }));
+    expect(on.status).toBe(200);
+    expect(existsSync(lanes)).toBe(true);
+    expect((await (await handle(request("/api/snapshot", authed))).json() as Snapshot).server.journal).toBe(true);
+    await Bun.sleep(300);
+    expect(deltas).toContain(true);
+    const off = await handle(post("/api/journal", { on: false }));
+    expect(off.status).toBe(200);
+    expect(existsSync(lanes)).toBe(false);
+    expect((await (await handle(request("/api/snapshot", authed))).json() as Snapshot).server.journal).toBe(false);
+    await Bun.sleep(300);
+    expect(deltas).toContain(false);
+    unsubscribe();
+  });
+
+  it("schedules stop after returning a successful response", async () => {
+    let stopped = false;
+    const handler = commandHandler(async () => ({ kind: "unknown-agent" }), () => { stopped = true; });
+    const response = await handler(post("/api/stop", {}));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true });
+    await Bun.sleep(40);
+    expect(stopped).toBe(true);
   });
 });

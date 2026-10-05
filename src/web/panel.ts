@@ -1,6 +1,8 @@
 import type { AgentId, AgentNode, Clipped, MessageLink, TimelineItem } from "../domain.ts";
+import { actionsFor, resumeCommand, type AgentActionId } from "../actions.ts";
 import { activityLine, ago, stalled, clockTime, compactNumber, duration, kindLabel, modelOf, prettyModel, shortPath, statusLine, summarizeInput } from "../format.ts";
-import type { TimelinePage } from "../wire.ts";
+import type { ActionResponse, TimelinePage } from "../wire.ts";
+import { postJson } from "./commands.ts";
 import { h, icon, providerIcon, toolIcon, type IconName } from "./dom.ts";
 
 // The drill-down: one agent's facts and its timeline,
@@ -74,6 +76,12 @@ export class Panel {
   private readonly nowLabel: HTMLElement;
   private readonly nowText: HTMLElement;
   private readonly note: HTMLElement;
+  private readonly actionBar: HTMLElement;
+  private readonly actionMessage: HTMLElement;
+  private readonly confirmations = new Map<AgentActionId, number>();
+  private cancelPending: AgentId | null = null;
+  private copiedUntil = 0;
+  private copiedAgent: AgentId | null = null;
   private readonly widen: HTMLButtonElement;
   private preferred = storedWidth();
   private maxWidth = Number.POSITIVE_INFINITY;
@@ -104,6 +112,8 @@ export class Panel {
     this.nowText = h("span", { class: "panel-now-text" });
     this.now = h("div", { class: "panel-now", attrs: { hidden: "" } }, this.nowLabel, this.nowText);
     this.note = h("p", { class: "panel-note", attrs: { hidden: "" } });
+    this.actionBar = h("div", { class: "panel-command-bar" });
+    this.actionMessage = h("p", { class: "command-message", attrs: { hidden: "", role: "status" } });
     const close = h("button", { class: "icon-button", title: "Close", attrs: { type: "button", "aria-label": "Close agent details" } }, icon("close"));
     close.addEventListener("click", () => this.events.close());
     this.widen = h("button", { class: "icon-button panel-widen", title: "Widen", attrs: { type: "button", "aria-label": "Widen panel", "aria-pressed": "false" } }, icon("widen"));
@@ -131,6 +141,8 @@ export class Panel {
         { class: "panel-head" },
         h("div", { class: "panel-identity" }, this.glyph, h("div", { class: "panel-names" }, this.title, this.kind), h("div", { class: "panel-actions" }, this.widen, close)),
         this.chip,
+        this.actionBar,
+        this.actionMessage,
         this.task,
         this.now,
         this.facts,
@@ -209,6 +221,8 @@ export class Panel {
     this.agent = node;
     this.nodes = nodes;
     if (switched) {
+      this.confirmations.clear();
+      this.actionMessage.hidden = true;
       this.items.clear();
       this.expanded.clear();
       this.older = null;
@@ -277,6 +291,7 @@ export class Panel {
     this.chip.dataset.status = node.status.kind;
     this.chip.dataset.stalled = String(stalled(node, now));
     this.chip.replaceChildren(icon(statusIcon(node)), h("span", { text: statusLine(node, now) }));
+    this.renderActions();
 
     this.task.hidden = node.prompt === null;
     this.taskText.textContent = node.prompt?.text ?? "";
@@ -325,6 +340,74 @@ export class Panel {
     if (node.health === "degraded") notes.push("Some records were not recognized.");
     this.note.textContent = notes.join(" ");
     this.note.hidden = notes.length === 0;
+  }
+
+  private renderActions(): void {
+    const node = this.agent;
+    if (node === null) return;
+    if (this.cancelPending === node.id && node.status.kind !== "running") this.cancelPending = null;
+    const buttons = actionsFor(node).map((action) => {
+      const pending = action.id === "cancel" && this.cancelPending === node.id;
+      const armed = (this.confirmations.get(action.id) ?? 0) > Date.now();
+      const copied = action.id === "copy-resume" && this.copiedAgent === node.id && this.copiedUntil > Date.now();
+      const button = h("button", {
+        class: "quiet-action",
+        text: pending ? "Cancelling…" : copied ? "Copied" : armed ? `Confirm: ${action.confirm}` : action.label,
+        attrs: { type: "button" },
+      });
+      button.disabled = pending;
+      button.addEventListener("click", () => {
+        if (action.confirm !== null && (this.confirmations.get(action.id) ?? 0) <= Date.now()) {
+          this.confirmations.set(action.id, Date.now() + 4_000);
+          this.renderActions();
+          window.setTimeout(() => this.renderActions(), 4_050);
+          return;
+        }
+        this.confirmations.delete(action.id);
+        if (action.id === "copy-resume") void this.copyResume(node);
+        else void this.cancelLane(node);
+      });
+      return button;
+    });
+    this.actionBar.replaceChildren(...buttons);
+    this.actionBar.hidden = buttons.length === 0;
+  }
+
+  private showActionMessage(message: string): void {
+    this.actionMessage.textContent = message;
+    this.actionMessage.hidden = message.length === 0;
+  }
+
+  private async copyResume(node: AgentNode): Promise<void> {
+    const command = resumeCommand(node);
+    if (command === null) return;
+    try {
+      await navigator.clipboard.writeText(command);
+      if (this.agent?.id !== node.id) return;
+      this.showActionMessage("");
+      this.copiedAgent = node.id;
+      this.copiedUntil = Date.now() + 2_000;
+      this.renderActions();
+      window.setTimeout(() => this.renderActions(), 2_050);
+    } catch {
+      if (this.agent?.id === node.id) this.showActionMessage("Could not copy the resume command.");
+    }
+  }
+
+  private async cancelLane(node: AgentNode): Promise<void> {
+    this.cancelPending = node.id;
+    this.showActionMessage("");
+    this.renderActions();
+    try {
+      const { status, data } = await postJson<ActionResponse>("/api/action", { agent: node.id, action: "cancel" });
+      if (status === 200 && data.ok) return;
+      this.cancelPending = null;
+      if (this.agent?.id === node.id) this.showActionMessage(data.message);
+    } catch {
+      this.cancelPending = null;
+      if (this.agent?.id === node.id) this.showActionMessage("Could not reach the monitor.");
+    }
+    this.renderActions();
   }
 
   private renderItems(prepended: boolean): void {
