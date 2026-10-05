@@ -71,6 +71,7 @@ Claude Code records which skill was active when each transcript record was writt
 - A skill you typed as a `/pstack:` command shows "typed by you". A skill the model chose on its own shows "the model's choice".
 - A lane is matched to the command that launched it by its receipt path, output path, or label, or else by time.
 - A skill's panel shows its trigger, the agent running it, its model, its steps, and its last text as markdown. A subagent or lane shows its final response as markdown; a lane's comes from the output file pstack's runner wrote.
+- **Skills: shown / hidden** in the canvas controls switches to an agents-only view. Drag a card to move it, or Shift-drag to move it with everything under it; positions are kept per session, and **Reset layout** clears them.
 - Codex records no skill attribution. A Codex skill run starts when the thread reads a pstack `SKILL.md`, and Codex runs stay flat under their thread.
 
 ## How it works
