@@ -1,0 +1,16 @@
+{
+  "name": "psf-monitor",
+  "owner": {
+    "name": "Martin Patino"
+  },
+  "description": "psf-monitor for Claude Code and Codex.",
+  "plugins": [
+    {
+      "name": "psf-monitor",
+      "source": "./",
+      "description": "A live local view of your pstack sessions: every subagent and external model lane they launch, with controls to cancel lanes.",
+      "version": "0.1.0",
+      "license": "MIT"
+    }
+  ]
+}

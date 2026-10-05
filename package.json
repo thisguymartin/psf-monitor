@@ -1,0 +1,17 @@
+{
+  "name": "psf-monitor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "psf-monitor": "./bin/psf-monitor"
+  },
+  "scripts": {
+    "test": "bun test src",
+    "typecheck": "tsc --project tsconfig.json && tsc --project src/web/tsconfig.json"
+  },
+  "devDependencies": {
+    "bun-types": "latest",
+    "typescript": "latest"
+  }
+}

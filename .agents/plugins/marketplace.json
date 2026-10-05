@@ -1,0 +1,21 @@
+{
+  "name": "psf-monitor",
+  "interface": {
+    "displayName": "psf-monitor"
+  },
+  "plugins": [
+    {
+      "name": "psf-monitor",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL",
+        "products": ["CODEX"]
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}
