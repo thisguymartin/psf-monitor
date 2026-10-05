@@ -13,7 +13,7 @@ Run one command and relay its output.
 | stop, kill, close, or shut down the monitor | `psf-monitor stop` |
 | check whether it is running, or get the link again | `psf-monitor status` |
 
-The launcher is `bin/psf-monitor` at the plugin root, two directories above this skill's base directory. Pass the harness you are running in as `--parent`.
+The launcher is `<base directory>/../../bin/psf-monitor`, where `<base directory>` is this skill's base directory as an absolute path. Run it by that absolute path, never as a path relative to the current directory. Pass the harness you are running in as `--parent`.
 
 `start` returns at once and prints one link. Give the user that link exactly as printed. The link carries an access token: never paste it anywhere else, and never open it with a fetch tool.
 
