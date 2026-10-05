@@ -1,6 +1,15 @@
 # psf-monitor
 
-psf-monitor is a live local view of [pstack](https://github.com/thisguymartin/pstack-flex) work on your machine. It draws each pstack session in Claude Code or Codex, every subagent it spawns, and every external model lane pstack's runner launches. Click an agent to see its task, what it is doing now, and its full activity as it streams.
+psf-monitor is a live local view of [pstack](https://github.com/thisguymartin/pstack-flex) work on your machine. It draws each pstack session in Claude Code or Codex as a tree of steps: the pstack skills it ran, the skills those skills started, and the subagents and external model lanes each skill launched. Click any step to see what started it, its model, what it is doing now, and its final response.
+
+```
+session
+└─ poteto-mode            typed by you · opus 5.5
+   ├─ lane "bug-fix"      gpt-6-sol · final response
+   └─ deslop              step 2
+      └─ no-comments      step 1
+         └─ subagent comment-sicko   final response
+```
 
 It shows pstack sessions only. A session appears once it runs a pstack skill or `/pstack:` command, spawns a pstack agent, or launches a pstack lane. Other Claude Code and Codex sessions never reach the page.
 
@@ -54,6 +63,15 @@ bin/psf-monitor journal <on|off|status>
 | `--focus <session id>` | Selects a session first. |
 | `--port <n>` | Port on 127.0.0.1. The default is 47317. |
 | `--hours <n>` | How far back to index. The default is 24. |
+
+## Skills as steps
+
+Claude Code records which skill was active when each transcript record was written, and the call that starts a skill records the skill that called it. psf-monitor uses that to place each pstack skill run under the run that triggered it, and each subagent or lane under the skill that was active when it started. Siblings are numbered in the order they started.
+
+- A skill you typed as a `/pstack:` command shows "typed by you". A skill the model chose on its own shows "the model's choice".
+- A lane is matched to the command that launched it by its receipt path, output path, or label, or else by time.
+- A skill's panel shows its trigger, the agent running it, its model, its steps, and its last text as markdown. A subagent or lane shows its final response as markdown; a lane's comes from the output file pstack's runner wrote.
+- Codex records no skill attribution. A Codex skill run starts when the thread reads a pstack `SKILL.md`, and Codex runs stay flat under their thread.
 
 ## How it works
 

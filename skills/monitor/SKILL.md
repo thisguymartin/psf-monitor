@@ -1,6 +1,6 @@
 ---
 name: monitor
-description: "Open a live local view of pstack work on this machine: every session that runs pstack and every agent it spawns, including native Claude and Codex subagents and external Codex, Grok, DeepSeek, and MiniMax lanes, with what each is doing now and a button to cancel a running lane. Also stops it. Use for /monitor, 'show me the agents', 'what is running', watching an arena, swarm, or interrogate fan-out, or 'stop / kill / shut down the monitor'."
+description: "Open a live local view of pstack work on this machine: every session that runs pstack as a tree of the pstack skills it ran, which skill started which, and the native subagents and external Codex, Grok, DeepSeek, and MiniMax lanes each skill launched, with each step's model, what it is doing now, its final response, and a button to cancel a running lane. Also stops it. Use for /monitor, 'show me the agents', 'what is running', watching an arena, swarm, or interrogate fan-out, or 'stop / kill / shut down the monitor'."
 ---
 
 # Monitor
