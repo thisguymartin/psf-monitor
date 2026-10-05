@@ -635,6 +635,22 @@ code {
   transition: background-color 0.18s, border-color 0.18s, box-shadow 0.3s var(--ease-out);
 }
 .card:hover { border-color: var(--line-strong); background: var(--card-hover); }
+.card[data-kind="skill"] { height: 64px; border-radius: 32px; background: var(--layer-2); border-color: var(--accent-soft); grid-template-columns: 32px minmax(0, 1fr) 22px; padding-left: 10px; }
+.card[data-kind="skill"] .card-glyph { width: 32px; height: 32px; border-radius: 50%; background: var(--accent-soft); color: var(--accent-strong); }
+.card[data-kind="skill"] .card-activity { display: none; }
+.skill-step { position: absolute; top: -9px; right: 9px; min-width: 19px; padding: 1px 5px; border-radius: 20px; background: var(--accent); color: var(--on-accent); font-size: 10px; text-align: center; font-weight: 700; }
+.skill-step[hidden] { display: none; }
+.wire-label { fill: var(--text-3); font: 10px var(--font-ui); pointer-events: none; }
+.panel-steps, .panel-result { padding: 12px 18px; border-top: 1px solid var(--line); }
+.panel-steps h3, .panel-result h3 { margin: 0 0 10px; font-size: 12px; color: var(--text-2); }
+.panel-step { width: 100%; display: grid; gap: 3px; margin: 4px 0; padding: 9px; background: var(--layer-2); color: var(--text); border: 1px solid var(--line); border-radius: 8px; text-align: left; cursor: pointer; }
+.panel-step small { color: var(--text-3); }
+.markdown { overflow-wrap: anywhere; line-height: 1.55; }
+.markdown :first-child { margin-top: 0; }
+.markdown pre { overflow: auto; padding: 10px; border-radius: 7px; background: var(--code-bg); }
+.markdown code { font-family: var(--font-mono); }
+.markdown blockquote { border-left: 2px solid var(--accent); margin-left: 0; padding-left: 12px; color: var(--text-2); }
+.markdown a { color: var(--accent-strong); }
 .card:focus-visible { outline-offset: 3px; border-radius: 14px; }
 .card[aria-pressed="true"] {
   border-color: var(--accent);

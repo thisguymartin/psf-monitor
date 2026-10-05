@@ -334,8 +334,8 @@ function render(): void {
   for (const node of shown.values()) {
     const root = rootOf(node.id, shown);
     if (root === node.id) continue;
-    const entry = descendants.get(root) ?? { total: 0, running: 0 };
-    descendants.set(root, { total: entry.total + 1, running: entry.running + (working(node, now) ? 1 : 0) });
+    const entry = descendants.get(root) ?? { total: 0, skills: 0, running: 0 };
+    descendants.set(root, { total: entry.total + (node.flavor.kind === "skill" ? 0 : 1), skills: entry.skills + (node.flavor.kind === "skill" ? 1 : 0), running: entry.running + (node.flavor.kind !== "skill" && working(node, now) ? 1 : 0) });
   }
   const hours = state.server?.windowHours ?? 24;
   rail.render(roots, descendants, state.session, now, `Last ${hours} hours`);
@@ -381,6 +381,7 @@ function render(): void {
       stat("running", counts.running, "running"),
       stat("waiting", counts.waiting, "waiting"),
       stat("spawned", counts.spawned, counts.spawned === 1 ? "agent" : "agents"),
+      stat("skills", counts.skills, counts.skills === 1 ? "skill" : "skills"),
       stat("done", counts.done, "done"),
       stat("failed", counts.failed, "failed"),
       ...(messages > 0 ? [stat("messages", messages, messages === 1 ? "message" : "messages")] : []),

@@ -130,6 +130,7 @@ export function statusLine(node: AgentNode, now: number): string {
 
 export function kindLabel(node: AgentNode): string {
   switch (node.flavor.kind) {
+    case "skill": return `pstack skill · ${triggerPhrase(node.flavor.trigger.kind)}`;
     case "session":
       return node.harness === "claude" ? "Claude Code session" : "Codex session";
     case "subagent": {
@@ -166,4 +167,9 @@ export function shortPath(path: string | null): string {
   if (path === null) return "";
   const parts = path.split("/").filter((part) => part.length > 0);
   return parts.length <= 2 ? path : `…/${parts.slice(-2).join("/")}`;
+}
+
+/** Who started a skill run; a skill trigger is drawn as the edge from its parent run. */
+export function triggerPhrase(trigger: "user" | "skill" | "model"): string {
+  return trigger === "user" ? "typed by you" : trigger === "skill" ? "called by a skill" : "the model's choice";
 }

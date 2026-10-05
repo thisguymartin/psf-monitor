@@ -90,7 +90,14 @@ export class Monitor {
   }
 
   timeline(agent: AgentId, before: number | null, limit: number): TimelinePage | null {
-    return this.store.isPstack(agent) ? this.index.timeline(agent, before, limit) : null;
+    if (!this.store.isPstack(agent)) return null;
+    const node = this.store.node(agent);
+    if (node?.flavor.kind === "skill") return { agent, items: [], older: null };
+    return this.index.timeline(agent, before, limit);
+  }
+
+  resultPath(agent: AgentId): string | null {
+    return this.store.resultPath(agent);
   }
 
   /** Indexes the window, probes processes once, then keeps everything current. */

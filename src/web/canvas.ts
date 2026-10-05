@@ -1,5 +1,5 @@
 import type { AgentId, AgentNode, AgentStatus, MessageLink } from "../domain.ts";
-import { activityLine, kindLabel, modelOf, quietFor, stalled, statusLine } from "../format.ts";
+import { activityLine, kindLabel, modelOf, quietFor, stalled, statusLine, triggerPhrase } from "../format.ts";
 import type { Tree } from "../graph.ts";
 import { connector, layout, messageArc, type Bounds, type Layout } from "../layout.ts";
 import { h, icon, providerIcon, svgElement, type IconName } from "./dom.ts";
@@ -39,6 +39,7 @@ interface View {
   readonly status: HTMLElement;
   readonly activity: HTMLElement;
   readonly badge: HTMLElement;
+  readonly step: HTMLElement;
   satellite: HTMLElement | null;
   tether: SVGGElement | null;
   node: AgentNode;
@@ -56,6 +57,7 @@ interface Wire {
   readonly base: SVGPathElement;
   readonly glow: SVGPathElement;
   readonly flow: SVGPathElement;
+  readonly label: SVGTextElement;
   readonly from: AgentId;
   readonly to: AgentId;
 }
@@ -188,7 +190,7 @@ export class Canvas {
       this.following = true;
       this.followButton.setAttribute("aria-pressed", "true");
     }
-    const next = layout(tree, (node) => modelOf(node) !== null);
+    const next = layout(tree, (node) => node.flavor.kind !== "skill" && modelOf(node) !== null);
     const seen = new Set<AgentId>();
     let added = false;
 
@@ -212,7 +214,7 @@ export class Canvas {
       view.fromY = view.y;
       view.toX = place.x;
       view.toY = place.y;
-      this.updateView(view, node, now, node.id === selected);
+      this.updateView(view, node, now, node.id === selected, tree.step.get(node.id) ?? null);
     }
     for (const [id, view] of this.views) {
       if (seen.has(id)) continue;
@@ -232,6 +234,10 @@ export class Canvas {
         this.wires.set(key, wire);
       }
       const child = this.views.get(edge.to)?.node;
+      const parent = this.views.get(edge.from)?.node;
+      const action = child?.flavor.kind === "skill" ? "invoked" : child?.flavor.kind === "lane" ? "launched" : "spawned";
+      wire.base.setAttribute("aria-label", `${parent?.title ?? "parent"} ${action} ${child?.title ?? "child"}`);
+      wire.label.textContent = child?.flavor.kind === "skill" || parent?.flavor.kind === "skill" ? action : "";
       const state = child === undefined ? "idle" : wireState(child);
       wire.base.dataset.state = state;
       wire.flow.dataset.state = state;
@@ -242,6 +248,7 @@ export class Canvas {
       wire.base.remove();
       wire.flow.remove();
       wire.glow.remove();
+      wire.label.remove();
       this.wires.delete(key);
     }
 
@@ -478,6 +485,8 @@ export class Canvas {
       wire.base.setAttribute("d", d);
       wire.flow.setAttribute("d", d);
       wire.glow.setAttribute("d", d);
+      wire.label.setAttribute("x", String((from.x + from.width + to.x) / 2));
+      wire.label.setAttribute("y", String((from.y + from.height / 2 + to.y + to.height / 2) / 2 - 8));
     }
     for (const talk of this.talks.values()) {
       const from = this.views.get(talk.from);
@@ -505,6 +514,7 @@ export class Canvas {
     const status = h("span", { class: "card-status" });
     const activity = h("span", { class: "card-activity" });
     const badge = h("span", { class: "card-badge", attrs: { "aria-hidden": "true" } });
+    const step = h("span", { class: "skill-step", attrs: { "aria-hidden": "true" } });
     const card = h(
       "button",
       { class: "card", attrs: { type: "button" } },
@@ -512,6 +522,7 @@ export class Canvas {
       h("span", { class: "port port-in", attrs: { "aria-hidden": "true" } }),
       glyph,
       h("span", { class: "card-text" }, title, h("span", { class: "card-meta" }, kind, h("span", { class: "card-sep", text: "·" }), status), activity),
+      step,
       badge,
       h("span", { class: "port port-out", attrs: { "aria-hidden": "true" } }),
     );
@@ -526,6 +537,7 @@ export class Canvas {
       status,
       activity,
       badge,
+      step,
       satellite: null,
       tether: null,
       node,
@@ -540,7 +552,7 @@ export class Canvas {
     };
   }
 
-  private updateView(view: View, node: AgentNode, now: number, selected: boolean): void {
+  private updateView(view: View, node: AgentNode, now: number, selected: boolean, step: number | null): void {
     const previous = view.node;
     view.node = node;
     const card = view.card;
@@ -556,15 +568,17 @@ export class Canvas {
     card.dataset.pending = String(node.pending !== null);
     card.setAttribute("aria-pressed", String(selected));
     view.title.textContent = node.title;
+    view.step.textContent = step === null ? "" : String(step);
+    view.step.hidden = node.flavor.kind !== "skill";
     // The root's glyph already names the harness; its card needs only a short label.
-    view.kind.textContent = node.flavor.kind === "session" ? (node.harness === "claude" ? "Claude Code" : "Codex") : kindLabel(node);
+    view.kind.textContent = node.flavor.kind === "skill" ? [node.flavor.trigger.kind === "skill" ? null : triggerPhrase(node.flavor.trigger.kind), modelOf(node)].filter((part) => part !== null).join(" · ") : node.flavor.kind === "session" ? (node.harness === "claude" ? "Claude Code" : "Codex") : kindLabel(node);
     view.status.textContent = statusLine(node, now);
     const doing = activityLine(node);
     view.activity.textContent = doing ?? "";
     view.activity.hidden = doing === null;
     card.setAttribute("aria-label", `${node.title}, ${kindLabel(node)}, ${statusLine(node, now)}`);
     card.title = node.title;
-    const glyphName = node.flavor.kind === "session" ? providerIcon(node.harness) : providerIcon(node.model.provider);
+    const glyphName = node.flavor.kind === "skill" ? "file" : node.flavor.kind === "session" ? providerIcon(node.harness) : providerIcon(node.model.provider);
     if (view.glyph.dataset.icon !== glyphName) {
       view.glyph.dataset.icon = glyphName;
       view.glyph.replaceChildren(icon(glyphName));
@@ -611,13 +625,14 @@ export class Canvas {
     const glow = svgElement("path", { class: "wire-glow" });
     const base = svgElement("path", { class: "wire" });
     const flow = svgElement("path", { class: "wire-flow" });
-    this.wiresBase.append(glow, base);
+    const label = svgElement("text", { class: "wire-label", "text-anchor": "middle" });
+    this.wiresBase.append(glow, base, label);
     this.wiresFlow.append(flow);
     if (entering && !this.reducedMotion.matches) {
       base.classList.add("is-drawing");
       base.addEventListener("animationend", () => base.classList.remove("is-drawing"), { once: true });
     }
-    return { base, glow, flow, from, to };
+    return { base, glow, flow, label, from, to };
   }
 
   private reset(): void {

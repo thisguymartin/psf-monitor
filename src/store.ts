@@ -9,6 +9,7 @@ import type {
   NormalizedUsage,
   PendingCall,
   Prompt,
+  Result,
   SourceKind,
   SpawnVia,
 } from "./domain.ts";
@@ -55,6 +56,9 @@ interface AgentState {
   openTurn: string | null;
   lastTurn: Ended | null;
   shapeErrors: number;
+  result: Result | null;
+  resultPath: string | null;
+  receiptPath: string | null;
 }
 
 interface ProcessEntry {
@@ -83,6 +87,7 @@ interface Message {
 }
 
 export interface StatusView {
+  currentSkill(id: AgentId): AgentId | null;
   process(id: AgentId): ProcessEntry | null;
   childOutcome(callId: string): { readonly outcome: ChildOutcome; readonly at: string | null; readonly reason: string | null } | null;
   /** True once the harness is known to keep per-process records on this machine. */
@@ -156,6 +161,12 @@ function childStatusFromOutcome(outcome: ChildOutcome, at: string | null, reason
 
 /** Status as a pure function of one agent's evidence and its relatives. */
 export function deriveStatus(agent: AgentState, view: StatusView): AgentStatus {
+  if (agent.flavor.kind === "skill") {
+    const runner = agent.flavor.runner;
+    return view.currentSkill(runner) === agent.id && view.status(runner)?.kind === "running"
+      ? { kind: "running", evidence: "parent" }
+      : { kind: "done", at: agent.lastActivityAt };
+  }
   if (agent.outcome !== null) return ended(agent.outcome);
   const flavor = agent.flavor;
   switch (flavor.kind) {
@@ -238,6 +249,7 @@ function claudeSubagentStatus(agent: AgentState, view: StatusView): AgentStatus 
 
 function defaultTitle(agent: AgentState): string {
   switch (agent.flavor.kind) {
+    case "skill": return agent.flavor.skill.slice("pstack:".length);
     case "session":
       return agent.harness === "claude" ? "Claude Code session" : "Codex session";
     case "subagent":
@@ -250,6 +262,9 @@ function defaultTitle(agent: AgentState): string {
 export class Store implements StatusView {
   private readonly agents = new Map<AgentId, AgentState>();
   private readonly spawnCalls = new Map<string, AgentId>();
+  private readonly laneCalls = new Map<string, { by: AgentId; at: string | null; command: string }>();
+  private readonly currentSkills = new Map<AgentId, AgentId | null>();
+  private laneMatches: Map<AgentId, { by: AgentId; at: string | null; command: string }> | null = null;
   private readonly childOutcomes = new Map<string, { outcome: ChildOutcome; at: string | null; reason: string | null }>();
   private readonly processes = new Map<string, ProcessEntry>();
   private readonly processByAgent = new Map<AgentId, string>();
@@ -274,6 +289,7 @@ export class Store implements StatusView {
         return;
       case "link": {
         const agent = this.ensure(fact.id, {});
+        if (agent.fallbackParent?.startsWith("skill:") && !fact.parent.startsWith("skill:") && fact.via === "thread-spawn") return;
         if (fact.parent !== fact.id) agent.fallbackParent = fact.parent;
         agent.via = fact.via;
         return;
@@ -287,6 +303,15 @@ export class Store implements StatusView {
       }
       case "spawn-call":
         this.spawnCalls.set(fact.callId, fact.by);
+        return;
+      case "lane-call":
+        this.laneCalls.set(fact.callId, { by: fact.by, at: fact.at, command: fact.command });
+        return;
+      case "current-skill":
+        this.currentSkills.set(fact.agent, fact.run);
+        return;
+      case "result":
+        this.ensure(fact.id, {}).result = fact.result;
         return;
       case "message":
         this.messages.set(fact.key, { from: fact.from, to: fact.to, at: fact.at });
@@ -397,6 +422,15 @@ export class Store implements StatusView {
     return this.agents.has(id);
   }
 
+  currentSkill(id: AgentId): AgentId | null {
+    return this.currentSkills.get(id) ?? null;
+  }
+
+  resultPath(id: AgentId): string | null {
+    const node = this.agents.get(id);
+    return node?.flavor.kind === "lane" && this.isPstack(id) ? node.resultPath : null;
+  }
+
   /** True when the agent's session root has a live process, so its files stay indexed. */
   isLive(id: AgentId): boolean {
     const entry = this.process(id);
@@ -430,10 +464,39 @@ export class Store implements StatusView {
   }
 
   private parentOf(agent: AgentState): AgentId | null {
+    if (agent.flavor.kind === "lane" && agent.fallbackParent !== null) {
+      const match = this.matchedLaneCalls().get(agent.id);
+      if (match !== undefined) return match.by;
+    }
     const parent = agent.spawnCall !== null
       ? this.spawnCalls.get(agent.spawnCall) ?? agent.fallbackParent
       : agent.fallbackParent;
     return parent === agent.id ? null : parent;
+  }
+
+  private matchedLaneCalls(): Map<AgentId, { by: AgentId; at: string | null; command: string }> {
+    if (this.laneMatches !== null) return this.laneMatches;
+    const matches = new Map<AgentId, { by: AgentId; at: string | null; command: string }>();
+    const used = new Set<string>();
+    const lanes = [...this.agents.values()].filter((agent) => agent.flavor.kind === "lane" && agent.fallbackParent !== null)
+      .sort((a, b) => (a.startedAt ?? "").localeCompare(b.startedAt ?? ""));
+    for (const lane of lanes) {
+      const calls = [...this.laneCalls].filter(([key, call]) => !used.has(key) &&
+        (call.by === lane.fallbackParent || this.agents.get(call.by)?.root === lane.fallbackParent));
+      const literal = [lane.receiptPath, lane.resultPath, lane.flavor.kind === "lane" ? lane.flavor.label : null]
+        .filter((value): value is string => value !== null && value.length > 0);
+      let selected = calls.find(([, call]) => literal.some((value) => call.command.includes(value)));
+      if (selected === undefined && lane.startedAt !== null) {
+        const started = Date.parse(lane.startedAt);
+        selected = calls.filter(([, call]) => {
+          const at = call.at === null ? Number.NaN : Date.parse(call.at);
+          return Number.isFinite(at) && at <= started && started - at <= 120_000;
+        }).sort((a, b) => (b[1].at ?? "").localeCompare(a[1].at ?? ""))[0];
+      }
+      if (selected !== undefined) { used.add(selected[0]); matches.set(lane.id, selected[1]); }
+    }
+    this.laneMatches = matches;
+    return matches;
   }
 
   /** The top of the spawn tree an agent belongs to, as far as the indexed agents reach. */
@@ -498,7 +561,7 @@ export class Store implements StatusView {
     return {
       id: agent.id,
       parent: this.parentOf(agent),
-      via: agent.via,
+      via: agent.flavor.kind === "lane" && this.parentOf(agent) !== agent.fallbackParent ? "runner" : agent.via,
       spawnCall: agent.spawnCall,
       harness: agent.harness,
       source: agent.source,
@@ -516,6 +579,7 @@ export class Store implements StatusView {
       lastActivityAt: agent.lastActivityAt,
       activity: agent.activity,
       prompt: agent.prompt,
+      result: agent.flavor.kind === "lane" && agent.resultPath !== null ? { kind: "file", bytes: null } : agent.result,
       pending: [...agent.openCalls.values()].at(-1) ?? null,
       usage: agent.usageTotal ?? sumUsage(agent.usageByKey.values()),
       health: agent.shapeErrors > 0 ? "degraded" : "ok",
@@ -566,6 +630,7 @@ export class Store implements StatusView {
     this.dirty = true;
     this.statusCache.clear();
     this.pstackRoots = null;
+    this.laneMatches = null;
   }
 
   private retractProcess(key: string): void {
@@ -610,6 +675,9 @@ export class Store implements StatusView {
       openTurn: null,
       lastTurn: null,
       shapeErrors: 0,
+      result: null,
+      resultPath: null,
+      receiptPath: null,
     };
     this.agents.set(id, created);
     return created;
@@ -619,6 +687,7 @@ export class Store implements StatusView {
     if (patch.harness !== undefined) agent.harness = patch.harness;
     if (patch.source !== undefined) agent.source = patch.source;
     if (patch.flavor !== undefined) agent.flavor = mergeFlavor(agent.flavor, patch.flavor);
+    if (agent.flavor.kind === "skill") agent.pstack = true;
     if (patch.root !== undefined) {
       agent.root = patch.root;
       if (agent.fallbackParent === null && patch.root !== agent.id) agent.fallbackParent = patch.root;
@@ -634,6 +703,8 @@ export class Store implements StatusView {
     if (patch.effort !== undefined) agent.effort = patch.effort;
     if (patch.title !== undefined) agent.title = patch.title;
     if (patch.titleHint !== undefined && agent.titleHint === null) agent.titleHint = patch.titleHint;
+    if (patch.resultPath !== undefined) agent.resultPath = patch.resultPath;
+    if (patch.receiptPath !== undefined) agent.receiptPath = patch.receiptPath;
     if (patch.seenAt !== undefined) {
       agent.startedAt = earlier(agent.startedAt, patch.seenAt);
       agent.lastActivityAt = later(agent.lastActivityAt, patch.seenAt);

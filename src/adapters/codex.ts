@@ -40,6 +40,8 @@ const IGNORED_TYPES = new Set([
 /** Paths and commands only pstack's skills and runner use. */
 const PSTACK_MARKERS = ["pstack-runner", "open-pstack/pstack/", "/pstack/skills/"];
 const PSTACK_WORD = /\bpstack\b/i;
+const SKILL_PATH = /(?:\/pstack\/[^/"\s]+\/skills\/|plugins\/pstack\/skills\/)([^/"\s]+)\/SKILL\.md/;
+const THREAD_UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
 const IGNORED_ITEMS = new Set(["ghost_snapshot"]);
 
@@ -78,6 +80,10 @@ class RolloutParser implements LineParser {
   private metaSeen = false;
   private historyStart: number | null = null;
   private isChild = false;
+  private current: AgentId | null = null;
+  private readonly spawnParents = new Map<string, AgentId>();
+  private readonly callOwners = new Map<string, AgentId>();
+  private model: string | null = null;
 
   constructor(private readonly agent: AgentId) {}
 
@@ -156,6 +162,7 @@ class RolloutParser implements LineParser {
   }
 
   private settings(model: string | null, effort: string | null, cwd: string | null): Fact {
+    if (model !== null) this.model = model;
     return {
       kind: "agent",
       id: this.agent,
@@ -171,21 +178,24 @@ class RolloutParser implements LineParser {
     const turnId = text(payload.turn_id) ?? "turn";
     switch (payload.type) {
       case "task_started":
-        return parsed([{ kind: "turn", id: this.agent, turnId, at, event: { kind: "started" } }]);
+        this.current = null;
+        return parsed([{ kind: "turn", id: this.agent, turnId, at, event: { kind: "started" } }, { kind: "current-skill", agent: this.agent, run: null }]);
       case "task_complete": {
+        this.current = null;
         const error = text(object(payload.error)?.message);
         const items: TimelineItem[] = error === null
           ? []
           : [{ id: itemId(offset, 0), at, kind: "notice", level: "error", text: oneLine(error, 400) }];
         return parsed(
-          [{ kind: "turn", id: this.agent, turnId, at, event: { kind: "ended", outcome: error === null ? "done" : "failed", reason: error } }],
+          [{ kind: "turn", id: this.agent, turnId, at, event: { kind: "ended", outcome: error === null ? "done" : "failed", reason: error } }, { kind: "current-skill", agent: this.agent, run: null }],
           items,
         );
       }
       case "turn_aborted": {
+        this.current = null;
         const reason = text(payload.reason);
         return parsed(
-          [{ kind: "turn", id: this.agent, turnId, at, event: { kind: "ended", outcome: "cancelled", reason } }],
+          [{ kind: "turn", id: this.agent, turnId, at, event: { kind: "ended", outcome: "cancelled", reason } }, { kind: "current-skill", agent: this.agent, run: null }],
           [{ id: itemId(offset, 0), at, kind: "notice", level: "info", text: `turn aborted${reason === null ? "" : `: ${reason}`}` }],
         );
       }
@@ -214,10 +224,14 @@ class RolloutParser implements LineParser {
         const body = contentText(payload.content);
         if (body.length === 0 || role === "developer" || role === "system") return NOTHING;
         if (role === "assistant") {
-          return parsed([textActivity(this.agent, body, at)], [{ id, at, kind: "text", body: clip(body, BODY_LIMIT) }]);
+          const target = this.current ?? this.agent;
+          const clipped = clip(body, BODY_LIMIT);
+          return parsed([textActivity(target, body, at), ...(target !== this.agent ? [{ kind: "result" as const, id: target, result: { kind: "text" as const, body: clipped } }] : []), ...(this.isChild ? [{ kind: "result" as const, id: this.agent, result: { kind: "text" as const, body: clipped } }] : [])], [{ id, at, kind: "text", body: clipped }]);
         }
         if (isInjectedContext(body)) return NOTHING;
+        this.current = null;
         const facts: Fact[] = this.isChild ? [] : [{ kind: "agent", id: this.agent, patch: { titleHint: oneLine(body, 80) } }];
+        facts.push({ kind: "current-skill", agent: this.agent, run: null });
         facts.push(promptFact(this.agent, body, at));
         // A child's prompt can quote its parent's history, so only a root prompt counts as asking for pstack.
         if (!this.isChild && PSTACK_WORD.test(body)) facts.push({ kind: "pstack", id: this.agent });
@@ -246,9 +260,25 @@ class RolloutParser implements LineParser {
         const callId = text(payload.call_id) ?? text(payload.id) ?? `${offset}`;
         const snippet = describeTool(name, firstLine(input));
         const facts: Fact[] = [
-          { kind: "activity", id: this.agent, activity: { what: "tool", snippet, at } },
-          { kind: "call", id: this.agent, callId, at, event: { kind: "started", name, snippet } },
+          { kind: "activity", id: this.current ?? this.agent, activity: { what: "tool", snippet, at } },
+          { kind: "call", id: this.current ?? this.agent, callId, at, event: { kind: "started", name, snippet } },
         ];
+        this.callOwners.set(callId, this.current ?? this.agent);
+        const skill = SKILL_PATH.exec(input)?.[1];
+        if (skill !== undefined) {
+          const run = `skill:${this.agent}/${callId}` as AgentId;
+          this.current = run;
+          facts.push(
+            { kind: "agent", id: run, patch: { harness: "codex", source: "codex-rollout", root: this.agent, flavor: { kind: "skill", skill: `pstack:${skill}`, trigger: { kind: "model" }, runner: this.agent }, title: skill, ...(at !== null ? { seenAt: at } : {}), ...(this.model !== null ? { requestedModel: this.model, reportedModel: this.model } : {}) } },
+            { kind: "link", id: run, parent: this.agent, via: "skill" },
+            { kind: "current-skill", agent: this.agent, run },
+          );
+        }
+        if (name === "spawn_agent") {
+          this.spawnParents.set(callId, this.current ?? this.agent);
+          facts.push({ kind: "spawn-call", by: this.current ?? this.agent, callId });
+        }
+        if (input.includes("pstack-runner")) facts.push({ kind: "lane-call", by: this.current ?? this.agent, callId, at, command: input });
         if (PSTACK_MARKERS.some((marker) => input.includes(marker))) facts.push({ kind: "pstack", id: this.agent });
         return parsed(facts, [{ id, at, kind: "tool-call", callId, name, input: clip(input, BODY_LIMIT) }]);
       }
@@ -258,7 +288,11 @@ class RolloutParser implements LineParser {
         const callId = text(payload.call_id);
         if (callId === null) return problem({ kind: "shape", recordType: `response_item/${type}`, detail: "missing call_id" });
         const output = typeof payload.output === "string" ? payload.output : contentText(payload.output);
-        return parsed([callEnded(this.agent, callId, at)], [{ id, at, kind: "tool-result", callId, ok: null, output: clip(output, BODY_LIMIT) }]);
+        const facts: Fact[] = [callEnded(this.callOwners.get(callId) ?? this.agent, callId, at)];
+        const child = this.spawnParents.get(callId);
+        const thread = THREAD_UUID.exec(output)?.[0];
+        if (child !== undefined && thread !== undefined) facts.push({ kind: "link", id: threadId(thread), parent: child, via: "thread-spawn" });
+        return parsed(facts, [{ id, at, kind: "tool-result", callId, ok: null, output: clip(output, BODY_LIMIT) }]);
       }
       case "agent_message": {
         // Recorded once, in the recipient's rollout.

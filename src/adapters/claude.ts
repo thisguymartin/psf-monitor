@@ -135,10 +135,25 @@ export function procStartMs(value: unknown): number | null {
 }
 
 class TranscriptParser implements LineParser {
+  private readonly runs = new Map<string, AgentId>();
+  private readonly callOwners = new Map<string, AgentId>();
+  private current: AgentId | null = null;
   constructor(
     private readonly agent: AgentId,
     private readonly root: AgentId,
   ) {}
+
+  private startSkill(skill: string, key: string, at: string | null, model: string | null, trigger: "user" | "skill" | "model", parent: AgentId, facts: Fact[]): AgentId {
+    const id = `skill:${this.agent}/${key}` as AgentId;
+    this.runs.set(skill, id);
+    this.current = id;
+    facts.push(
+      { kind: "agent", id, patch: { harness: "claude", source: "claude-session", root: this.root, flavor: { kind: "skill", skill, trigger: { kind: trigger }, runner: this.agent }, title: skill.slice(PSTACK_PREFIX.length), ...(at !== null ? { seenAt: at } : {}), ...(model !== null ? { requestedModel: model, reportedModel: model } : {}) } },
+      { kind: "link", id, parent, via: "skill" },
+      { kind: "current-skill", agent: this.agent, run: id },
+    );
+    return id;
+  }
 
   line(line: string, offset: number): Parsed {
     const raw = parseJson(line);
@@ -196,6 +211,20 @@ class TranscriptParser implements LineParser {
     const out = collected();
     out.facts.push(seen);
     const model = text(message.model);
+    const attributed = text(record.attributionSkill);
+    let run = attributed?.startsWith(PSTACK_PREFIX) ? this.runs.get(attributed) ?? null : null;
+    // A subagent's records inherit the parent's attribution; only a session's own records imply a run.
+    if (attributed?.startsWith(PSTACK_PREFIX) && run === null && this.agent === this.root) {
+      run = this.startSkill(attributed, text(record.uuid) ?? `${offset}`, at, model, "model", this.agent, out.facts);
+    }
+    if (run !== this.current) {
+      this.current = run;
+      out.facts.push({ kind: "current-skill", agent: this.agent, run });
+    }
+    const target = run ?? this.agent;
+    if (run !== null && model !== null && model !== "<synthetic>") {
+      out.facts.push({ kind: "agent", id: run, patch: { requestedModel: model, reportedModel: model } });
+    }
     const effort = text(record.effort);
     if ((model !== null && model !== "<synthetic>") || effort !== null) {
       out.facts.push({
@@ -213,12 +242,39 @@ class TranscriptParser implements LineParser {
       out.facts.push({ kind: "usage", id: this.agent, key: text(message.id) ?? `${offset}`, usage });
     }
     assistantBlocks(this.agent, offset, at, message.content, out);
+    if (run !== null) {
+      out.facts.forEach((fact, index) => {
+        if (fact.kind === "spawn-call") out.facts[index] = { ...fact, by: run };
+      });
+      for (const fact of [...out.facts]) if (fact.kind === "activity" && fact.id === this.agent) out.facts.push({ ...fact, id: run });
+    }
+    for (const item of out.items) if (item.kind === "tool-call") this.callOwners.set(item.callId, this.agent);
+    for (const item of out.items) if (item.kind === "text") {
+      if (target !== this.agent) out.facts.push({ kind: "result", id: target, result: { kind: "text", body: item.body } });
+      if (this.agent !== this.root) out.facts.push({ kind: "result", id: this.agent, result: { kind: "text", body: item.body } });
+    }
+    for (const block of array(message.content)) {
+      const call = object(block);
+      if (call?.type !== "tool_use") continue;
+      const input = object(call.input);
+      const callId = text(call.id) ?? `${offset}`;
+      if (call.name === "Skill") {
+        const skill = text(input?.skill);
+        if (skill?.startsWith(PSTACK_PREFIX)) this.startSkill(skill, callId, at, model, run === null ? "model" : "skill", target, out.facts);
+      }
+      if (call.name === "Bash") {
+        const command = text(input?.command);
+        if (command?.includes("pstack-runner")) out.facts.push({ kind: "lane-call", by: target, callId, at, command });
+      }
+    }
     if (pstackAttribution(record) && !out.facts.some((fact) => fact.kind === "pstack")) {
       out.facts.push({ kind: "pstack", id: this.agent });
     }
     // Partial records carry a null stop reason and `tool_use` waits on results; only these end the turn.
     if (TURN_ENDS.has(text(message.stop_reason) ?? "")) {
       out.facts.push({ kind: "turn", id: this.agent, turnId: TURN, at, event: { kind: "ended", outcome: "done", reason: null } });
+      this.current = null;
+      out.facts.push({ kind: "current-skill", agent: this.agent, run: null });
     }
     for (const block of array(message.content)) {
       const call = object(block);
@@ -275,7 +331,7 @@ class TranscriptParser implements LineParser {
     if (record.isMeta === true) {
       for (const block of array(content)) {
         const callId = text(object(block)?.tool_use_id);
-        if (object(block)?.type === "tool_result" && callId !== null) facts.push(callEnded(this.agent, callId, at));
+        if (object(block)?.type === "tool_result" && callId !== null) facts.push(callEnded(this.callOwners.get(callId) ?? this.agent, callId, at));
       }
       return parsed(facts, items, cliVersion);
     }
@@ -290,7 +346,7 @@ class TranscriptParser implements LineParser {
       if (block.type === "tool_result") {
         const item = toolResult(offset, index, at, block);
         if (item !== null) items.push(item);
-        if (item?.kind === "tool-result") facts.push(callEnded(this.agent, item.callId, at));
+        if (item?.kind === "tool-result") facts.push(callEnded(this.callOwners.get(item.callId) ?? this.agent, item.callId, at));
       } else if (block.type === "text") {
         const body = text(block.text);
         if (body !== null) this.prompt(body, offset, index, at, facts, items);
@@ -313,16 +369,24 @@ class TranscriptParser implements LineParser {
     if (command !== null) {
       items.push({ id: itemId(offset, index), at, kind: "notice", level: "info", text: `ran ${oneLine(command, 80)}` });
       // No turn: a built-in command such as /model gets no reply that would close it.
-      if (command.replace(/^\//, "").startsWith(PSTACK_PREFIX)) facts.push({ kind: "pstack", id: this.agent });
+      const skill = command.replace(/^\//, "");
+      if (skill.startsWith(PSTACK_PREFIX)) {
+        facts.push({ kind: "pstack", id: this.agent });
+        this.startSkill(skill, `${offset}.${index}`, at, null, "user", this.agent, facts);
+      }
       return;
     }
     if (body.startsWith("<local-command") || body.startsWith("<system-reminder>")) return;
     if (body.startsWith("[Request interrupted")) {
       items.push({ id: itemId(offset, index), at, kind: "notice", level: "info", text: "interrupted by the user" });
       facts.push({ kind: "turn", id: this.agent, turnId: TURN, at, event: { kind: "ended", outcome: "cancelled", reason: "interrupted by the user" } });
+      this.current = null;
+      facts.push({ kind: "current-skill", agent: this.agent, run: null });
       return;
     }
     items.push({ id: itemId(offset, index), at, kind: "prompt", body: clip(body, BODY_LIMIT) });
+    this.current = null;
+    facts.push({ kind: "current-skill", agent: this.agent, run: null });
     facts.push(
       { kind: "agent", id: this.agent, patch: { titleHint: oneLine(body, 80) } },
       { kind: "turn", id: this.agent, turnId: TURN, at, event: { kind: "started" } },

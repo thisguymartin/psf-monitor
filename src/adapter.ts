@@ -7,6 +7,7 @@ import type {
   SourceKind,
   SpawnVia,
   TimelineItem,
+  Result,
 } from "./domain.ts";
 
 // Adapters are the only code that knows a transcript
@@ -34,6 +35,8 @@ export interface AgentPatch {
   readonly title?: string;
   /** Used only when nothing better is known; the first hint sticks. */
   readonly titleHint?: string;
+  readonly resultPath?: string;
+  readonly receiptPath?: string;
 }
 
 export type Outcome = "done" | "failed" | "cancelled";
@@ -66,6 +69,9 @@ export type Fact =
       readonly fallback: AgentId;
     }
   | { readonly kind: "spawn-call"; readonly by: AgentId; readonly callId: string }
+  | { readonly kind: "lane-call"; readonly by: AgentId; readonly callId: string; readonly at: string | null; readonly command: string }
+  | { readonly kind: "current-skill"; readonly agent: AgentId; readonly run: AgentId | null }
+  | { readonly kind: "result"; readonly id: AgentId; readonly result: Result }
   // `key` is unique per message, so a message seen twice counts once.
   | {
       readonly kind: "message";

@@ -7,6 +7,7 @@ import type { Tree } from "./graph.ts";
 
 export const CARD_WIDTH = 264;
 export const CARD_HEIGHT = 84;
+export const SKILL_HEIGHT = 64;
 export const ROOT_WIDTH = 304;
 export const ROOT_HEIGHT = 100;
 export const COLUMN_GAP = 112;
@@ -53,7 +54,7 @@ export function layout(tree: Tree, hasSatellite: (node: AgentNode) => boolean): 
 
   // Returns the vertical center of the node's card.
   const place = (node: AgentNode, depth: number): number => {
-    const height = node === tree.root ? ROOT_HEIGHT : CARD_HEIGHT;
+    const height = node === tree.root ? ROOT_HEIGHT : node.flavor.kind === "skill" ? SKILL_HEIGHT : CARD_HEIGHT;
     const satellite = hasSatellite(node);
     const slot = height + (satellite ? SATELLITE_SPACE : 0);
     const children = (tree.children.get(node.id) ?? []).filter((child) => tree.depth.get(child.id) === depth + 1);

@@ -1,4 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
+import { open } from "node:fs/promises";
 import { AGENT_ACTIONS } from "./actions.ts";
 import type { CancelResult } from "./control.ts";
 import type { AgentId } from "./domain.ts";
@@ -11,6 +12,7 @@ import type { ServerEvent } from "./wire.ts";
 const MAX_PAGE = 400;
 const MAX_ID = 300;
 const MAX_BODY = 4 * 1024;
+const MAX_RESULT = 256 * 1024;
 
 export interface Assets {
   readonly html: string;
@@ -191,6 +193,25 @@ export function createHandler(monitor: Monitor, options: HandlerOptions) {
         return respond(200, options.assets.css, { "Content-Type": "text/css; charset=utf-8" });
       case "/api/snapshot":
         return json(monitor.snapshot());
+      case "/api/result": {
+        const agent = agentParam(url.searchParams.get("agent"));
+        const path = agent === null ? null : monitor.resultPath(agent);
+        if (path === null || agent === null) return plain(404, "result not found");
+        try {
+          const file = await open(path, "r");
+          try {
+            if (!(await file.stat()).isFile()) return plain(404, "result not found");
+            const buffer = Buffer.alloc(MAX_RESULT + 1);
+            const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+            const truncated = bytesRead > MAX_RESULT;
+            return json({ agent, format: "markdown", text: new TextDecoder().decode(buffer.subarray(0, Math.min(bytesRead, MAX_RESULT))), truncated });
+          } finally {
+            await file.close();
+          }
+        } catch {
+          return plain(404, "result not found");
+        }
+      }
       case "/api/timeline": {
         const agent = agentParam(url.searchParams.get("agent"));
         if (agent === null) return plain(400, "agent is required");

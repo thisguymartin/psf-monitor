@@ -29,6 +29,7 @@ function node(id: string, parent: string | null, status: AgentStatus["kind"] = "
     lastActivityAt: startedAt,
     activity: null,
     prompt: null,
+    result: null,
     pending: null,
     usage: { inputTokens: 10, outputTokens: 5 },
     health: "ok",
@@ -56,7 +57,8 @@ describe("graph", () => {
   it("orders children by start time and counts the tree", () => {
     const tree = treeOf("root" as AgentId, nodes)!;
     expect(tree.nodes.map((entry) => entry.id)).toEqual(["root", "a", "a1", "b"] as never);
-    expect(countsOf(tree)).toEqual({ spawned: 3, running: 1, waiting: 0, done: 1, failed: 1, tokens: 60 });
+    expect([...tree.step]).toEqual([["a", 1], ["b", 2], ["a1", 1]] as never);
+    expect(countsOf(tree)).toEqual({ spawned: 3, skills: 0, running: 1, waiting: 0, done: 1, failed: 1, tokens: 60 });
   });
 
   it("survives a parent cycle", () => {

@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { claudeAdapter } from "./adapters/claude.ts";
+import { buildAssets } from "./assets.ts";
 import type { AgentId } from "./domain.ts";
 import { parseArgs } from "./cli.ts";
 import { launchUrl, summarize } from "./daemon.ts";
@@ -118,6 +119,39 @@ describe("access control", () => {
 });
 
 describe("data", () => {
+  it("serves the bundled page with the token cookie", async () => {
+    const assets = await buildAssets();
+    const bundled = createHandler(monitor, { port: PORT, token: TOKEN, assets, lanes: join(scratch, "lanes"), cancel: async () => ({ kind: "unknown-agent" }), stop: () => {} });
+    const response = await bundled(request("/app.js", { cookie: `psf_monitor_${PORT}=${TOKEN}` }));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("text/javascript");
+    expect((await response.text()).length).toBeGreaterThan(10_000);
+  });
+  it("serves only visible lane results and limits output to 256 KiB", async () => {
+    const monitor = new Monitor({ adapters: [], fs: diskFileSystem, table: async () => new Map(), windowHours: 24, version: "test", instance: "result-test", lanes: join(scratch, "lanes") });
+    const handle = createHandler(monitor, { port: PORT, token: TOKEN, assets: { html: "", css: "", js: "" }, lanes: join(scratch, "lanes"), cancel: async () => ({ kind: "unknown-agent" }), stop: () => {} });
+    monitor.store.apply({ kind: "agent", id: "claude:s1" as AgentId, patch: { flavor: { kind: "session" } } });
+    monitor.store.apply({ kind: "pstack", id: "claude:s1" as AgentId });
+    const lane = "lane:result" as AgentId;
+    const output = join(scratch, "result.md");
+    const patch = { harness: "claude" as const, source: "runner-lane" as const, flavor: { kind: "lane" as const, mode: "read-only" as const, stream: "live" as const, label: "review", receipt: null }, resultPath: output };
+    monitor.store.apply({ kind: "agent", id: lane, patch });
+    monitor.store.apply({ kind: "link", id: lane, parent: "claude:s1" as AgentId, via: "runner" });
+    writeFileSync(output, "# Final\nDone.");
+    const result = await handle(request(`/api/result?agent=${encodeURIComponent(lane)}`, authed));
+    expect(result.status).toBe(200);
+    expect(await result.json()).toEqual({ agent: lane, format: "markdown", text: "# Final\nDone.", truncated: false });
+    writeFileSync(output, "x".repeat(256 * 1024 + 10));
+    const large = await handle(request(`/api/result?agent=${encodeURIComponent(lane)}`, authed));
+    expect(await large.json()).toMatchObject({ truncated: true, text: "x".repeat(256 * 1024) });
+    expect((await handle(request("/api/result?agent=lane:missing", authed))).status).toBe(404);
+    expect((await handle(request("/api/result?agent=claude:s1", authed))).status).toBe(404);
+    const hidden = "lane:hidden" as AgentId;
+    monitor.store.apply({ kind: "agent", id: hidden, patch: { ...patch, resultPath: output } });
+    expect((await handle(request("/api/result?agent=lane:hidden", authed))).status).toBe(404);
+    rmSync(output);
+    expect((await handle(request(`/api/result?agent=${encodeURIComponent(lane)}`, authed))).status).toBe(404);
+  });
   it("serves the snapshot", async () => {
     const snapshot = (await (await handle(request("/api/snapshot", authed))).json()) as Snapshot;
     expect(snapshot.server).toMatchObject({ app: "psf-monitor", indexing: false });

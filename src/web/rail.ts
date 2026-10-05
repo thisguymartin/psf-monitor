@@ -10,6 +10,7 @@ export interface RailEvents {
 
 export interface Descendants {
   readonly total: number;
+  readonly skills: number;
   readonly running: number;
 }
 
@@ -98,6 +99,7 @@ export class Rail {
 
   private row(root: AgentNode, counts: Descendants | undefined, group: Group, selected: boolean, now: number): HTMLElement {
     const total = counts?.total ?? 0;
+    const skills = counts?.skills ?? 0;
     const running = counts?.running ?? 0;
     const button = h(
       "button",
@@ -123,9 +125,10 @@ export class Rail {
         "span",
         {
           class: "session-side",
-          attrs: { "aria-label": `${total} ${total === 1 ? "agent" : "agents"}${running > 0 ? `, ${running} running` : ""}` },
+          attrs: { "aria-label": `${total} ${total === 1 ? "agent" : "agents"}, ${skills} ${skills === 1 ? "skill" : "skills"}${running > 0 ? `, ${running} running` : ""}` },
         },
         total > 0 ? h("span", { class: "session-count", attrs: { "data-running": String(running > 0) } }, icon("agent"), h("span", { text: String(total) })) : null,
+        skills > 0 ? h("span", { class: "session-count", text: `${skills} ${skills === 1 ? "skill" : "skills"}` }) : null,
         h("span", { class: "session-dot", attrs: { "aria-hidden": "true" } }),
       ),
     );

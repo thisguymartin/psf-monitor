@@ -261,6 +261,8 @@ function laneRecord(path: string, id: AgentId, record: Partial<LaneRecord>): Par
         ...(started !== null ? { seenAt: started } : {}),
         ...(label !== null ? { title: oneLine(label, 120) } : {}),
         ...(head !== null ? { titleHint: oneLine(head, 80) } : {}),
+        ...(text(record.outputPath) !== null ? { resultPath: text(record.outputPath)! } : {}),
+        ...(text(record.receiptPath) !== null ? { receiptPath: text(record.receiptPath)! } : {}),
       },
     },
     // Only pstack's runner writes a lane record.

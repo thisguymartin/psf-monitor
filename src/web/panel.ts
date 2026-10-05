@@ -4,6 +4,7 @@ import { activityLine, ago, stalled, clockTime, compactNumber, duration, kindLab
 import type { ActionResponse, TimelinePage } from "../wire.ts";
 import { postJson } from "./commands.ts";
 import { h, icon, providerIcon, toolIcon, type IconName } from "./dom.ts";
+import { markdown } from "./markdown.ts";
 
 // The drill-down: one agent's facts and its timeline,
 // streaming while the agent works.
@@ -70,6 +71,12 @@ export class Panel {
   private readonly kind: HTMLElement;
   private readonly chip: HTMLElement;
   private readonly facts: HTMLElement;
+  private readonly steps: HTMLElement;
+  private readonly finalResponse: HTMLElement;
+  private resultLoadedFor: AgentId | null = null;
+  private laneText: string | null = null;
+  private laneTruncated = false;
+  private renderedResponseKey = "";
   private readonly task: HTMLElement;
   private readonly taskText: HTMLElement;
   private readonly now: HTMLElement;
@@ -106,6 +113,8 @@ export class Panel {
     this.kind = h("p", { class: "panel-kind" });
     this.chip = h("p", { class: "status-chip" });
     this.facts = h("dl", { class: "facts" });
+    this.steps = h("section", { class: "panel-steps", attrs: { hidden: "" } });
+    this.finalResponse = h("section", { class: "panel-result", attrs: { hidden: "" } });
     this.taskText = h("p", { class: "panel-task-text" });
     this.task = h("div", { class: "panel-task", attrs: { hidden: "" } }, h("span", { class: "panel-label", text: "Task" }), this.taskText);
     this.nowLabel = h("span", { class: "panel-label" });
@@ -128,7 +137,7 @@ export class Panel {
     this.olderButton.addEventListener("click", () => void this.loadOlder());
     this.list = h("ol", { class: "timeline-items" });
     this.emptyNote = h("p", { class: "timeline-empty", attrs: { hidden: "" } });
-    this.scroller = h("div", { class: "timeline", attrs: { tabindex: "0", "aria-label": "Activity" } }, this.olderButton, this.list, this.emptyNote);
+    this.scroller = h("div", { class: "timeline", attrs: { tabindex: "0", "aria-label": "Activity" } }, this.steps, this.finalResponse, this.olderButton, this.list, this.emptyNote);
     this.scroller.addEventListener("scroll", () => this.onScroll(), { passive: true });
     this.jump = h("button", { class: "jump", attrs: { type: "button", hidden: "" } }, icon("arrowDown"), h("span", { text: "New activity" }));
     this.jump.addEventListener("click", () => this.scrollToEnd(true));
@@ -221,6 +230,10 @@ export class Panel {
     this.agent = node;
     this.nodes = nodes;
     if (switched) {
+      this.resultLoadedFor = null;
+      this.laneText = null;
+      this.laneTruncated = false;
+      this.renderedResponseKey = "";
       this.confirmations.clear();
       this.actionMessage.hidden = true;
       this.items.clear();
@@ -260,7 +273,8 @@ export class Panel {
     this.older = page.older;
     this.loaded = true;
     this.renderItems(false);
-    this.scrollToEnd(false);
+    if (this.agent?.flavor.kind === "skill" || this.agent?.result !== null) this.scroller.scrollTop = 0;
+    else this.scrollToEnd(false);
   }
 
   append(agent: AgentId, items: readonly TimelineItem[]): void {
@@ -281,7 +295,7 @@ export class Panel {
     if (node === null) return;
     this.element.dataset.harness = node.harness;
     this.element.dataset.provider = node.model.provider;
-    const glyphName = node.flavor.kind === "session" ? providerIcon(node.harness) : providerIcon(node.model.provider);
+    const glyphName = node.flavor.kind === "skill" ? "file" : node.flavor.kind === "session" ? providerIcon(node.harness) : providerIcon(node.model.provider);
     if (this.glyph.dataset.icon !== glyphName) {
       this.glyph.dataset.icon = glyphName;
       this.glyph.replaceChildren(icon(glyphName));
@@ -307,6 +321,18 @@ export class Panel {
     this.nowText.title = doing ?? "";
 
     const rows: [string, Node | string][] = [];
+    if (node.flavor.kind === "skill") {
+      const trigger = node.flavor.trigger.kind;
+      const parent = node.parent === null ? null : this.nodes.get(node.parent) ?? null;
+      const parentName = parent?.flavor.kind === "skill" ? parent.flavor.skill : parent?.title ?? "another skill";
+      rows.push(["Trigger", trigger === "user" ? "Typed by you" : trigger === "skill" ? `Started by ${parentName}` : "Started by the model"]);
+      const runner = this.nodes.get(node.flavor.runner);
+      if (runner !== undefined) {
+        const link = h("button", { class: "link", text: runner.title, attrs: { type: "button" } });
+        link.addEventListener("click", () => this.events.select(runner.id));
+        rows.push(["Runner", link]);
+      }
+    }
     const model = modelOf(node);
     if (model !== null) {
       const requested = prettyModel(node.model.requested);
@@ -327,13 +353,51 @@ export class Panel {
     if (parent !== undefined) {
       const link = h("button", { class: "link", text: parent.title, attrs: { type: "button" } });
       link.addEventListener("click", () => this.events.select(parent.id));
-      rows.push(["Spawned by", link]);
+      rows.push([node.flavor.kind === "skill" ? "Parent" : "Spawned by", link]);
     }
     const sent = this.links.filter((link) => link.from === node.id).reduce((sum, link) => sum + link.count, 0);
     const received = this.links.filter((link) => link.to === node.id).reduce((sum, link) => sum + link.count, 0);
     if (sent + received > 0) rows.push(["Messages", `${sent} sent · ${received} received`]);
     if (node.cwd !== null) rows.push(["Folder", h("span", { class: "mono", text: shortPath(node.cwd), title: node.cwd })]);
     this.facts.replaceChildren(...rows.flatMap(([term, value]) => [h("dt", { text: term }), h("dd", {}, value)]));
+
+    const children = [...this.nodes.values()].filter((child) => child.parent === node.id)
+      .sort((a, b) => (a.startedAt ?? "").localeCompare(b.startedAt ?? "") || a.id.localeCompare(b.id));
+    this.steps.replaceChildren(h("h3", { text: "Steps" }), ...children.map((child, index) => {
+      const button = h("button", { class: "panel-step", attrs: { type: "button" } },
+        h("span", { text: `${index + 1}. ${child.title}` }),
+        h("small", { text: `${kindLabel(child)} · ${modelOf(child) ?? "model unknown"} · ${child.status.kind}` }));
+      button.addEventListener("click", () => this.events.select(child.id));
+      return button;
+    }));
+    this.steps.hidden = node.flavor.kind !== "skill" || children.length === 0;
+    const response = node.result?.kind === "text" ? node.result.body.text : node.result?.kind === "file" ? this.laneText : null;
+    const omitted = node.result?.kind === "text" ? node.result.body.omitted : this.laneTruncated ? 1 : 0;
+    const responseKey = JSON.stringify([response, omitted]);
+    if (responseKey !== this.renderedResponseKey) {
+      this.renderedResponseKey = responseKey;
+      this.finalResponse.replaceChildren(...(response === null ? [] : [
+        h("h3", { text: "Final response" }), markdown(response),
+        ...(omitted > 0 ? [h("p", { class: "t-clipped", text: node.result?.kind === "file" ? "Response truncated at 256 KiB" : `${omitted.toLocaleString()} more characters not shown` })] : []),
+      ]));
+    }
+    this.finalResponse.hidden = response === null;
+    if (node.result?.kind === "file" && this.resultLoadedFor !== node.id) {
+      this.resultLoadedFor = node.id;
+      this.laneText = null;
+      void fetch(`/api/result?agent=${encodeURIComponent(node.id)}`).then(async (reply) => {
+        if (!reply.ok) throw new Error("result unavailable");
+        const data = await reply.json() as { text: string; truncated: boolean };
+        if (this.agent?.id !== node.id) return;
+        this.laneText = data.text;
+        this.laneTruncated = data.truncated;
+        this.renderHeader(Date.now());
+      }).catch(() => {
+        if (this.agent?.id !== node.id) return;
+        this.resultLoadedFor = null;
+        window.setTimeout(() => { if (this.agent?.id === node.id) this.renderHeader(Date.now()); }, 2_000);
+      });
+    }
 
     const notes: string[] = [];
     if (node.status.kind === "unknown") notes.push(capitalize(node.status.why));
@@ -453,6 +517,7 @@ export class Panel {
     this.emptyNote.hidden = rows.length > 0;
     this.emptyNote.textContent = node.flavor.kind === "lane" && node.flavor.stream === "at-exit"
       ? "The reply arrives when the lane exits."
+      : node.flavor.kind === "skill" ? "Activity is recorded in the runner's transcript."
       : "No activity yet.";
     if (prepended) this.scroller.scrollTop += this.scroller.scrollHeight - previousHeight;
   }

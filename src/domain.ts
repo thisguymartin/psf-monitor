@@ -6,7 +6,7 @@ import type { AccessMode, NormalizedUsage, ReceiptStatus } from "./pstack.ts";
 declare const brand: unique symbol;
 type Brand<T, B extends string> = T & { readonly [brand]: B };
 
-/** `claude:<session>`, `claude:<session>:<agent>`, `codex:<thread>`, or `lane:<lane>`. */
+/** `claude:<session>`, `claude:<session>:<agent>`, `codex:<thread>`, `lane:<lane>`, or `skill:<runner agent id>/<call id or record uuid>`. */
 export type AgentId = Brand<string, "AgentId">;
 /** `<byteOffset>.<index>` of the record an item came from, in its agent's file. */
 export type ItemId = Brand<string, "ItemId">;
@@ -28,6 +28,7 @@ export type AgentStatus =
 export type Flavor =
   | { readonly kind: "session" }
   | { readonly kind: "subagent"; readonly agentType: string | null }
+  | { readonly kind: "skill"; readonly skill: string; readonly trigger: SkillTrigger; readonly runner: AgentId }
   | {
       readonly kind: "lane";
       readonly mode: AccessMode;
@@ -37,7 +38,8 @@ export type Flavor =
       readonly receipt: ReceiptStatus | null;
     };
 
-export type SpawnVia = "tool-use" | "thread-spawn" | "runner" | "team";
+export type SkillTrigger = { readonly kind: "user" } | { readonly kind: "skill" } | { readonly kind: "model" };
+export type SpawnVia = "tool-use" | "thread-spawn" | "runner" | "team" | "skill";
 
 export interface ModelInfo {
   readonly provider: string;
@@ -82,6 +84,7 @@ export interface AgentNode {
   readonly lastActivityAt: string | null;
   readonly activity: Activity | null;
   readonly prompt: Prompt | null;
+  readonly result: Result | null;
   readonly pending: PendingCall | null;
   readonly usage: NormalizedUsage | null;
   readonly health: Health;
@@ -100,6 +103,8 @@ export interface Clipped {
   /** Characters dropped from the end. */
   readonly omitted: number;
 }
+
+export type Result = { readonly kind: "text"; readonly body: Clipped } | { readonly kind: "file"; readonly bytes: number | null };
 
 export type TimelineItem = { readonly id: ItemId; readonly at: string | null } & (
   | { readonly kind: "prompt" | "text"; readonly body: Clipped }

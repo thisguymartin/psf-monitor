@@ -9,10 +9,12 @@ export interface Tree {
   readonly nodes: readonly AgentNode[];
   readonly children: ReadonlyMap<AgentId, readonly AgentNode[]>;
   readonly depth: ReadonlyMap<AgentId, number>;
+  readonly step: ReadonlyMap<AgentId, number>;
 }
 
 export interface Counts {
   readonly spawned: number;
+  readonly skills: number;
   readonly running: number;
   readonly waiting: number;
   readonly done: number;
@@ -78,6 +80,8 @@ export function treeOf(rootId: AgentId, nodes: ReadonlyMap<AgentId, AgentNode>):
     else siblings.push(node);
   }
   for (const siblings of children.values()) siblings.sort(byStart);
+  const step = new Map<AgentId, number>();
+  for (const siblings of children.values()) siblings.forEach((node, index) => step.set(node.id, index + 1));
   const ordered: AgentNode[] = [];
   const depth = new Map<AgentId, number>();
   const visit = (node: AgentNode, level: number): void => {
@@ -87,7 +91,7 @@ export function treeOf(rootId: AgentId, nodes: ReadonlyMap<AgentId, AgentNode>):
     for (const child of children.get(node.id) ?? []) visit(child, level + 1);
   };
   visit(root, 0);
-  return { root, nodes: ordered, children, depth };
+  return { root, nodes: ordered, children, depth, step };
 }
 
 export function tokenTotal(usage: NormalizedUsage | null): number {
@@ -101,9 +105,13 @@ export function countsOf(tree: Tree, now = Date.now()): Counts {
   let done = 0;
   let failed = 0;
   let tokens = 0;
+  let skills = 0;
+  let spawned = 0;
   for (const node of tree.nodes) {
-    tokens += tokenTotal(node.usage);
+    if (node.flavor.kind !== "skill") tokens += tokenTotal(node.usage);
+    if (node.flavor.kind === "skill") { skills += 1; continue; }
     if (node === tree.root) continue;
+    spawned += 1;
     switch (node.status.kind) {
       case "running":
         if (working(node, now)) running += 1;
@@ -121,5 +129,5 @@ export function countsOf(tree: Tree, now = Date.now()): Counts {
         break;
     }
   }
-  return { spawned: tree.nodes.length - 1, running, waiting, done, failed, tokens };
+  return { spawned, skills, running, waiting, done, failed, tokens };
 }
