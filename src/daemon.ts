@@ -212,10 +212,13 @@ export async function stop(where: Homes, io: Io): Promise<number> {
   return 0;
 }
 
-export function summarize(agents: readonly AgentNode[]): string {
+export function summarize(nodes: readonly AgentNode[]): string {
+  const agents = nodes.filter((node) => node.flavor.kind !== "skill");
+  const skills = nodes.length - agents.length;
   const counts = new Map<string, number>();
   for (const agent of agents) counts.set(agent.status.kind, (counts.get(agent.status.kind) ?? 0) + 1);
-  const parts = [`${agents.length} agents`];
+  const parts = [`${agents.length} ${agents.length === 1 ? "agent" : "agents"}`];
+  if (skills > 0) parts.push(`${skills} ${skills === 1 ? "skill" : "skills"}`);
   for (const kind of ["running", "idle", "failed", "done", "cancelled", "ended", "unknown"]) {
     const count = counts.get(kind);
     if (count !== undefined) parts.push(`${count} ${kind}`);

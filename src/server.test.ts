@@ -206,8 +206,10 @@ describe("launcher", () => {
   });
 
   it("summarizes agent counts in a stable order", () => {
-    const node = (kind: "running" | "done") => ({ status: kind === "running" ? { kind, evidence: "pid" } : { kind, at: null } }) as never;
+    const node = (kind: "running" | "done", flavor: "session" | "skill" = "session") =>
+      ({ flavor: { kind: flavor }, status: kind === "running" ? { kind, evidence: "pid" } : { kind, at: null } }) as never;
     expect(summarize([node("done"), node("running"), node("running")])).toBe("3 agents · 2 running · 1 done");
+    expect(summarize([node("running"), node("running", "skill"), node("done", "skill")])).toBe("1 agent · 2 skills · 1 running");
   });
 });
 
