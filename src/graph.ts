@@ -42,6 +42,25 @@ export function parentOf(node: AgentNode, nodes: ReadonlyMap<AgentId, AgentNode>
   return node.parent !== null && nodes.has(node.parent) ? node.parent : null;
 }
 
+export function withoutSkills(nodes: ReadonlyMap<AgentId, AgentNode>): Map<AgentId, AgentNode> {
+  const shown = new Map<AgentId, AgentNode>();
+  for (const node of nodes.values()) {
+    if (node.flavor.kind === "skill") continue;
+    let parent = node.parent;
+    const seen = new Set<AgentId>([node.id]);
+    while (parent !== null) {
+      if (seen.has(parent)) { parent = null; break; }
+      seen.add(parent);
+      const ancestor = nodes.get(parent);
+      if (ancestor === undefined) { parent = null; break; }
+      if (ancestor.flavor.kind !== "skill") break;
+      parent = ancestor.parent;
+    }
+    shown.set(node.id, parent === node.parent ? node : { ...node, parent });
+  }
+  return shown;
+}
+
 /** Sessions to list: live ones first, then most recently active. */
 export function rootsOf(nodes: ReadonlyMap<AgentId, AgentNode>, now = Date.now()): AgentNode[] {
   return [...nodes.values()]

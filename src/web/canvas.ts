@@ -2,6 +2,7 @@ import type { AgentId, AgentNode, AgentStatus, MessageLink } from "../domain.ts"
 import { activityLine, kindLabel, modelOf, quietFor, stalled, statusLine, triggerPhrase } from "../format.ts";
 import type { Tree } from "../graph.ts";
 import { connector, layout, messageArc, type Bounds, type Layout } from "../layout.ts";
+import { applyOffsets, clearOffsets, moveNode, moveSubtree, type Offset } from "../offsets.ts";
 import { h, icon, providerIcon, svgElement, type IconName } from "./dom.ts";
 
 // The node canvas: cards for agents, wires for spawn
@@ -30,6 +31,28 @@ const CAMERA_MS = 480;
 const MAX_SPARKS = 24;
 const TETHER_X = 44;
 const TETHER_LENGTH = 22;
+const DRAG_THRESHOLD = 4;
+const OFFSET_KEY = "psf-monitor.offsets.";
+
+function loadOffsets(root: AgentId): Map<AgentId, Offset> {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(`${OFFSET_KEY}${root}`) ?? "null");
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return new Map();
+    return new Map(Object.entries(value).flatMap(([id, offset]) => {
+      if (offset === null || typeof offset !== "object" || Array.isArray(offset)) return [];
+      const { x, y } = offset as { x?: unknown; y?: unknown };
+      return typeof x === "number" && Number.isFinite(x) && typeof y === "number" && Number.isFinite(y)
+        ? [[id as AgentId, { x, y }] as const] : [];
+    }));
+  } catch { return new Map(); }
+}
+
+function storeOffsets(root: AgentId, offsets: ReadonlyMap<AgentId, Offset>): void {
+  try {
+    if (offsets.size === 0) localStorage.removeItem(`${OFFSET_KEY}${root}`);
+    else localStorage.setItem(`${OFFSET_KEY}${root}`, JSON.stringify(Object.fromEntries(offsets)));
+  } catch { /* Storage is unavailable; positions last for this page only. */ }
+}
 
 interface View {
   readonly card: HTMLButtonElement;
@@ -78,6 +101,7 @@ interface Camera {
 
 export interface CanvasEvents {
   select(id: AgentId): void;
+  toggleSkills(): void;
 }
 
 const easeOut = (t: number): number => 1 - Math.pow(1 - t, 4);
@@ -94,11 +118,17 @@ export class Canvas {
   private readonly talks = new Map<string, Talk>();
   private readonly zoomLabel: HTMLElement;
   private readonly followButton: HTMLButtonElement;
+  private readonly skillsButton: HTMLButtonElement;
+  private readonly resetButton: HTMLButtonElement;
   private readonly empty: HTMLElement;
   private readonly views = new Map<AgentId, View>();
   private readonly wires = new Map<string, Wire>();
   private readonly reducedMotion = matchMedia("(prefers-reduced-motion: reduce)");
   private current: Layout | null = null;
+  private base: Layout | null = null;
+  private tree: Tree | null = null;
+  private offsets = new Map<AgentId, Offset>();
+  private suppressClick: AgentId | null = null;
   private rootId: AgentId | null = null;
   private selected: AgentId | null = null;
   private camera: Camera = { x: 0, y: 0, k: 1 };
@@ -141,6 +171,11 @@ export class Canvas {
       icon("follow"),
     );
     this.followButton.addEventListener("click", () => this.setFollowing(!this.following, true));
+    this.skillsButton = h("button", { class: "control control-text", attrs: { type: "button", "aria-pressed": "true" } }, icon("skills"), h("span"));
+    this.skillsButton.addEventListener("click", () => this.events.toggleSkills());
+    this.setSkillsShown(true);
+    this.resetButton = h("button", { class: "control control-text", attrs: { type: "button", hidden: "", title: "Reset layout" } }, icon("reset"), h("span", { text: "Reset layout" }));
+    this.resetButton.addEventListener("click", () => this.resetLayout());
     const control = (name: "minus" | "plus" | "fit", label: string, action: () => void): HTMLButtonElement => {
       const button = h("button", { class: "control", title: label, attrs: { type: "button", "aria-label": label } }, icon(name));
       button.addEventListener("click", action);
@@ -155,6 +190,9 @@ export class Canvas {
       h("span", { class: "controls-rule" }),
       control("fit", "Fit to view", () => this.fit(true)),
       this.followButton,
+      h("span", { class: "controls-rule" }),
+      this.skillsButton,
+      this.resetButton,
     );
     this.empty = h("div", { class: "canvas-empty", attrs: { hidden: "" } });
     this.element = h("div", { class: "viewport", attrs: { tabindex: "0", "aria-label": "Agent graph" } }, this.world, this.empty, controls);
@@ -168,6 +206,22 @@ export class Canvas {
   setEmpty(content: Node | null): void {
     this.empty.replaceChildren(...(content === null ? [] : [content]));
     this.empty.toggleAttribute("hidden", content === null);
+  }
+
+  setSkillsShown(shown: boolean): void {
+    const label = shown ? "Skills: shown" : "Skills: hidden";
+    this.skillsButton.querySelector("span")!.textContent = label;
+    this.skillsButton.title = label;
+    this.skillsButton.setAttribute("aria-label", label);
+    this.skillsButton.setAttribute("aria-pressed", String(shown));
+  }
+
+  private resetLayout(): void {
+    if (this.rootId === null || this.base === null) return;
+    this.offsets = clearOffsets();
+    storeOffsets(this.rootId, this.offsets);
+    this.resetButton.hidden = true;
+    this.showOffsets();
   }
 
   /** `reveal: false` while a drag is still changing the inset, so the camera does not chase it. */
@@ -187,10 +241,14 @@ export class Canvas {
     if (fresh) {
       this.reset();
       this.rootId = tree.root.id;
+      this.offsets = loadOffsets(tree.root.id);
       this.following = true;
       this.followButton.setAttribute("aria-pressed", "true");
     }
-    const next = layout(tree, (node) => node.flavor.kind !== "skill" && modelOf(node) !== null);
+    this.tree = tree;
+    this.base = layout(tree, (node) => node.flavor.kind !== "skill" && modelOf(node) !== null);
+    const next = applyOffsets(this.base, this.offsets);
+    this.resetButton.hidden = this.offsets.size === 0;
     const seen = new Set<AgentId>();
     let added = false;
 
@@ -526,7 +584,10 @@ export class Canvas {
       badge,
       h("span", { class: "port port-out", attrs: { "aria-hidden": "true" } }),
     );
-    card.addEventListener("click", () => this.events.select(node.id));
+    card.addEventListener("click", (event) => {
+      if (this.suppressClick === node.id) { this.suppressClick = null; event.preventDefault(); return; }
+      this.events.select(node.id);
+    });
     if (entering && !this.reducedMotion.matches) card.classList.add("is-entering");
     this.cards.append(card);
     return {
@@ -648,22 +709,78 @@ export class Canvas {
     this.wires.clear();
     this.talks.clear();
     this.current = null;
+    this.base = null;
+    this.tree = null;
+    this.resetButton.hidden = true;
+  }
+
+  private showOffsets(): void {
+    if (this.base === null) return;
+    this.current = applyOffsets(this.base, this.offsets);
+    if (this.moveFrame !== null) cancelAnimationFrame(this.moveFrame);
+    this.moveFrame = null;
+    for (const [id, place] of this.current.placed) {
+      const view = this.views.get(id);
+      if (view === undefined) continue;
+      view.x = view.fromX = view.toX = place.x;
+      view.y = view.fromY = view.toY = place.y;
+    }
+    this.drawPositions();
   }
 
   private bindPointer(): void {
     let drag: { id: number; x: number; y: number; cx: number; cy: number } | null = null;
+    let cardDrag: { pointer: number; id: AgentId; card: HTMLButtonElement; x: number; y: number; lastX: number; lastY: number; subtree: boolean; moved: boolean } | null = null;
     this.element.addEventListener("pointerdown", (event) => {
-      if (event.button !== 0 || (event.target as Element).closest(".card, .controls") !== null) return;
+      if (event.button !== 0) return;
+      const card = (event.target as Element).closest<HTMLButtonElement>(".card");
+      if (card !== null) {
+        const entry = [...this.views.values()].find((view) => view.card === card);
+        if (entry === undefined) return;
+        this.suppressClick = null;
+        cardDrag = { pointer: event.pointerId, id: entry.node.id, card, x: event.clientX, y: event.clientY, lastX: event.clientX, lastY: event.clientY, subtree: event.shiftKey, moved: false };
+        card.setPointerCapture(event.pointerId);
+        return;
+      }
+      if ((event.target as Element).closest(".controls") !== null) return;
       drag = { id: event.pointerId, x: event.clientX, y: event.clientY, cx: this.camera.x, cy: this.camera.y };
       this.element.setPointerCapture(event.pointerId);
       this.element.classList.add("is-panning");
     });
     this.element.addEventListener("pointermove", (event) => {
+      if (cardDrag !== null && cardDrag.pointer === event.pointerId) {
+        if (!cardDrag.moved && Math.hypot(event.clientX - cardDrag.x, event.clientY - cardDrag.y) >= DRAG_THRESHOLD) {
+          cardDrag.moved = true;
+          cardDrag.card.classList.add("is-dragging");
+          this.setFollowing(false, false);
+        }
+        if (cardDrag.moved) {
+          const dx = (event.clientX - cardDrag.lastX) / this.camera.k;
+          const dy = (event.clientY - cardDrag.lastY) / this.camera.k;
+          if (this.tree !== null) this.offsets = cardDrag.subtree
+            ? moveSubtree(this.offsets, this.tree, cardDrag.id, dx, dy)
+            : moveNode(this.offsets, cardDrag.id, dx, dy);
+          this.showOffsets();
+          this.resetButton.hidden = this.offsets.size === 0;
+          cardDrag.lastX = event.clientX;
+          cardDrag.lastY = event.clientY;
+        }
+        return;
+      }
       if (drag === null || drag.id !== event.pointerId) return;
       this.setFollowing(false, false);
       this.moveCamera({ k: this.camera.k, x: drag.cx + event.clientX - drag.x, y: drag.cy + event.clientY - drag.y }, false);
     });
     const end = (event: PointerEvent): void => {
+      if (cardDrag !== null && cardDrag.pointer === event.pointerId) {
+        cardDrag.card.classList.remove("is-dragging");
+        if (cardDrag.moved) {
+          this.suppressClick = cardDrag.id;
+          if (this.rootId !== null) storeOffsets(this.rootId, this.offsets);
+        }
+        cardDrag = null;
+        return;
+      }
       if (drag === null || drag.id !== event.pointerId) return;
       drag = null;
       this.element.classList.remove("is-panning");

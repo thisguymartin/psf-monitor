@@ -635,6 +635,7 @@ code {
   transition: background-color 0.18s, border-color 0.18s, box-shadow 0.3s var(--ease-out);
 }
 .card:hover { border-color: var(--line-strong); background: var(--card-hover); }
+.card { cursor: grab; }
 .card[data-kind="skill"] { height: 64px; border-radius: 32px; background: var(--layer-2); border-color: var(--accent-soft); grid-template-columns: 32px minmax(0, 1fr) 22px; padding-left: 10px; }
 .card[data-kind="skill"] .card-glyph { width: 32px; height: 32px; border-radius: 50%; background: var(--accent-soft); color: var(--accent-strong); }
 .card[data-kind="skill"] .card-activity { display: none; }
@@ -676,6 +677,13 @@ code {
 .card[data-status="unknown"] { border-style: dashed; }
 .card[data-health="degraded"] {
   background-image: repeating-linear-gradient(135deg, transparent 0 7px, rgb(255 255 255 / 0.035) 7px 8px);
+}
+.card.is-dragging {
+  cursor: grabbing;
+  z-index: 1;
+  border-color: var(--accent);
+  background: var(--card-hover);
+  box-shadow: 0 0 0 3px var(--accent-soft), 0 20px 42px -12px rgb(0 0 0 / 0.8);
 }
 .card.is-entering { animation: enter 0.55s var(--ease-out) both; }
 .card.is-pulsing { animation: pulse 0.75s var(--ease-out); }
@@ -889,6 +897,8 @@ code {
 .control:hover { background: var(--layer-2); color: var(--text); }
 .control[aria-pressed="true"] { color: var(--accent-strong); background: var(--accent-soft); }
 .control .icon { width: 17px; height: 17px; }
+.control-text { width: auto; display: flex; gap: 6px; padding: 0 9px; font-size: 12px; white-space: nowrap; }
+.control[hidden] { display: none; }
 .controls-zoom {
   min-width: 46px;
   text-align: center;
@@ -1528,7 +1538,7 @@ code {
   .panel { width: 100%; border-left: 0; }
   .panel-resizer,
   .panel-widen { display: none; }
-  .controls { left: 10px; bottom: 10px; }
+  .controls { left: 10px; bottom: 10px; max-width: calc(100% - 20px); flex-wrap: wrap; }
 }
 
 @media (max-width: 540px) {

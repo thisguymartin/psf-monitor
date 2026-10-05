@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { AgentId, AgentNode, AgentStatus } from "./domain.ts";
-import { countsOf, rootOf, rootsOf, treeOf } from "./graph.ts";
+import { countsOf, rootOf, rootsOf, treeOf, withoutSkills } from "./graph.ts";
 import { CARD_HEIGHT, COLUMN_GAP, connector, layout, messageArc, ROOT_HEIGHT, ROOT_WIDTH, SATELLITE_SPACE } from "./layout.ts";
 
 function node(id: string, parent: string | null, status: AgentStatus["kind"] = "done", startedAt = "2026-10-01T10:00:00Z"): AgentNode {
@@ -65,6 +65,21 @@ describe("graph", () => {
     const cyclic = index(node("x", "y"), node("y", "x"));
     expect(rootOf("x" as AgentId, cyclic)).toBeDefined();
     expect(rootsOf(cyclic)).toEqual([]);
+  });
+
+  it("removes skill chains and attaches agents to the nearest visible ancestor", () => {
+    const root = node("root", null);
+    const first = { ...node("s1", "root"), flavor: { kind: "skill" as const, skill: "one", trigger: { kind: "user" as const }, runner: root.id } };
+    const second = { ...node("s2", "s1"), flavor: { kind: "skill" as const, skill: "two", trigger: { kind: "skill" as const }, runner: root.id } };
+    const child = node("child", "s2");
+    const grandchild = node("grandchild", "child");
+    const original = index(root, first, second, child, grandchild);
+    const filtered = withoutSkills(original);
+    expect([...filtered.keys()]).toEqual([root.id, child.id, grandchild.id]);
+    expect(filtered.get(child.id)?.parent).toBe(root.id);
+    expect(filtered.get(grandchild.id)).toBe(grandchild);
+    expect(original.get(child.id)?.parent).toBe(second.id);
+    expect(treeOf(root.id, filtered)?.nodes.map((entry) => entry.id)).toEqual([root.id, child.id, grandchild.id]);
   });
 });
 

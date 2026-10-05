@@ -1,6 +1,6 @@
 import type { AgentId, AgentNode, Harness, MessageLink, SourceKind } from "../domain.ts";
 import { compactNumber, shortPath, working } from "../format.ts";
-import { countsOf, isLive, rootOf, rootsOf, treeOf } from "../graph.ts";
+import { countsOf, isLive, rootOf, rootsOf, treeOf, withoutSkills } from "../graph.ts";
 import type { Delta, JournalResponse, ServerInfo, Snapshot, SourceHealth, TimelineAppend, TimelinePage } from "../wire.ts";
 import { Canvas } from "./canvas.ts";
 import { postJson } from "./commands.ts";
@@ -21,6 +21,17 @@ const RETRY_MS = 3_000;
 /** Canvas kept visible beside the panel; narrower than this and the panel overlays it. */
 const CANVAS_MIN = 360;
 const PANEL_GUTTER = 240;
+const SKILLS_KEY = "psf-monitor.skills-shown";
+
+function storedSkillsShown(): boolean {
+  try { return localStorage.getItem(SKILLS_KEY) !== "false"; }
+  catch { return true; }
+}
+
+function storeSkillsShown(shown: boolean): void {
+  try { localStorage.setItem(SKILLS_KEY, String(shown)); }
+  catch { /* Storage is unavailable; the choice lasts for this page only. */ }
+}
 
 type Connection = "connecting" | "live" | "retrying" | "expired" | "stopped";
 
@@ -50,7 +61,17 @@ const state: State = {
   dismissed: "",
 };
 
-const canvas = new Canvas({ select: (id) => selectAgent(id) });
+let skillsShown = storedSkillsShown();
+
+const canvas = new Canvas({ select: (id) => selectAgent(id), toggleSkills: () => {
+  skillsShown = !skillsShown;
+  storeSkillsShown(skillsShown);
+  canvas.setSkillsShown(skillsShown);
+  if (state.session !== null && !visibleNodes().has(state.session)) state.session = chooseSession();
+  if (!skillsShown && state.agent !== null && state.nodes.get(state.agent)?.flavor.kind === "skill") selectAgent(null);
+  else render();
+} });
+canvas.setSkillsShown(skillsShown);
 const panel = new Panel({
   close: () => selectAgent(null),
   select: (id) => selectAgent(id),
@@ -173,6 +194,10 @@ document.documentElement.dataset.harness = defaultHarness;
 let source: EventSource | null = null;
 let retryTimer: number | null = null;
 
+function visibleNodes(): ReadonlyMap<AgentId, AgentNode> {
+  return skillsShown ? state.nodes : withoutSkills(state.nodes);
+}
+
 function connect(): void {
   if (state.connection === "stopped") return;
   source?.close();
@@ -226,7 +251,7 @@ function onSnapshot(snapshot: Snapshot): void {
   state.links = snapshot.links;
   state.health = snapshot.health;
   state.server = snapshot.server;
-  const shown = state.nodes;
+  const shown = visibleNodes();
   if (state.session === null || !shown.has(state.session)) state.session = chooseSession();
   if (state.agent !== null && !shown.has(state.agent)) state.agent = null;
   setConnection("live");
@@ -252,19 +277,20 @@ function onDelta(delta: Delta): void {
   }
   if (delta.health !== null) state.health = delta.health;
   if (state.server !== null) state.server = { ...state.server, indexing: delta.indexing, journal: delta.journal };
-  if (state.session === null || !state.nodes.has(state.session)) state.session = chooseSession();
+  if (state.session === null || !visibleNodes().has(state.session)) state.session = chooseSession();
   render();
   for (const id of pulses) canvas.pulse(id);
   for (const link of talks) canvas.pulseMessage(link.from, link.to);
 }
 
 function chooseSession(): AgentId | null {
-  const shown = state.nodes;
+  const shown = visibleNodes();
   if (pendingFocus !== null) {
     const focus = pendingFocus;
-    if (shown.has(focus)) {
+    if (state.nodes.has(focus)) {
+      const root = rootOf(focus, state.nodes);
       pendingFocus = null;
-      return rootOf(focus, shown);
+      if (shown.has(root)) return root;
     }
   }
   const now = Date.now();
@@ -288,14 +314,16 @@ function selectSession(root: AgentId): void {
 
 function selectAgent(id: AgentId | null): void {
   if (id === state.agent) return;
+  const shown = visibleNodes();
+  if (id !== null && !shown.has(id)) return;
   state.agent = id;
   if (id === null) {
     panel.close();
     canvas.setRightInset(0);
     render();
+    connect();
     return;
   }
-  const shown = state.nodes;
   const node = shown.get(id);
   if (node === undefined) return;
   const root = rootOf(id, shown);
@@ -328,11 +356,12 @@ function toggleRail(open?: boolean): void {
 
 function render(): void {
   const now = Date.now();
-  const shown = state.nodes;
+  const all = state.nodes;
+  const shown = visibleNodes();
   const roots = rootsOf(shown, now);
   const descendants = new Map<AgentId, Descendants>();
-  for (const node of shown.values()) {
-    const root = rootOf(node.id, shown);
+  for (const node of all.values()) {
+    const root = rootOf(node.id, all);
     if (root === node.id) continue;
     const entry = descendants.get(root) ?? { total: 0, skills: 0, running: 0 };
     descendants.set(root, { total: entry.total + (node.flavor.kind === "skill" ? 0 : 1), skills: entry.skills + (node.flavor.kind === "skill" ? 1 : 0), running: entry.running + (node.flavor.kind !== "skill" && working(node, now) ? 1 : 0) });
@@ -341,6 +370,7 @@ function render(): void {
   rail.render(roots, descendants, state.session, now, `Last ${hours} hours`);
 
   const tree = state.session === null ? null : treeOf(state.session, shown);
+  const fullTree = state.session === null ? null : treeOf(state.session, all);
   canvas.render(tree, state.agent, now, state.links);
   document.documentElement.dataset.harness = tree?.root.harness ?? defaultHarness;
 
@@ -356,7 +386,7 @@ function render(): void {
         h("p", {}, "Run ", h("code", { text: "psf-monitor start" }), " and open the new link."),
       ),
     );
-  } else if (shown.size === 0) {
+  } else if (all.size === 0) {
     canvas.setEmpty(emptyState(state.server?.indexing === true));
   } else if (tree !== null && tree.nodes.length === 1) {
     canvas.setEmpty(h("p", { class: "canvas-hint", text: "No agents spawned yet." }));
@@ -372,8 +402,8 @@ function render(): void {
     sessionTitle.textContent = tree.root.title;
     sessionPath.textContent = shortPath(tree.root.cwd);
     sessionPath.title = tree.root.cwd ?? "";
-    const counts = countsOf(tree, now);
-    const members = new Set(tree.nodes.map((node) => node.id));
+    const counts = countsOf(fullTree!, now);
+    const members = new Set(fullTree!.nodes.map((node) => node.id));
     const messages = state.links
       .filter((link) => members.has(link.from) && members.has(link.to))
       .reduce((sum, link) => sum + link.count, 0);
