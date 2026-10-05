@@ -1,7 +1,7 @@
 {
   "name": "psf-monitor",
   "displayName": "psf-monitor",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A live local view of your pstack sessions: every subagent and external model lane they launch, with controls to cancel lanes.",
   "author": {
     "name": "Martin Patino"
