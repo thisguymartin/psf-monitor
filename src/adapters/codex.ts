@@ -35,6 +35,7 @@ const IGNORED_TYPES = new Set([
   "token_usage_record",
   "compacted",
   "inter_agent_communication_metadata",
+  "retained_context",
 ]);
 
 /** Paths and commands only pstack's skills and runner use. */

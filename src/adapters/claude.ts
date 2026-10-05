@@ -39,6 +39,9 @@ import {
 
 const IGNORED = new Set([
   "attachment",
+  "frame-link",
+  "artifact-autoreact-ledger",
+  "artifact-comment-monitor",
   "mode",
   "permission-mode",
   "last-prompt",
@@ -399,7 +402,7 @@ export function claudeAdapter(home: string): Adapter {
   return {
     source: "claude-session",
     windowed: true,
-    checkedVersion: "2.1.287",
+    checkedVersion: "2.1.289",
     roots: [
       { dir: join(home, "sessions"), depth: 1, processRecords: "claude" },
       { dir: join(home, "projects"), depth: 4 },
