@@ -180,7 +180,7 @@ export function deriveStatus(agent: AgentState, view: StatusView): AgentStatus {
     }
     case "session":
     case "subagent": {
-      if (agent.harness === "codex") return codexStatus(agent, flavor.kind === "session");
+      if (agent.harness === "codex" || agent.harness === "opencode") return codexStatus(agent, flavor.kind === "session");
       if (flavor.kind === "session") return claudeSessionStatus(agent, view);
       return claudeSubagentStatus(agent, view);
     }
@@ -251,7 +251,7 @@ function defaultTitle(agent: AgentState): string {
   switch (agent.flavor.kind) {
     case "skill": return agent.flavor.skill.slice("pstack:".length);
     case "session":
-      return agent.harness === "claude" ? "Claude Code session" : "Codex session";
+      return agent.harness === "claude" ? "Claude Code session" : agent.harness === "opencode" ? "OpenCode session" : "Codex session";
     case "subagent":
       return agent.flavor.agentType ?? "subagent";
     case "lane":
@@ -464,7 +464,7 @@ export class Store implements StatusView {
   }
 
   private parentOf(agent: AgentState): AgentId | null {
-    if (agent.flavor.kind === "lane" && agent.fallbackParent !== null) {
+    if (agent.flavor.kind === "lane") {
       const match = this.matchedLaneCalls().get(agent.id);
       if (match !== undefined) return match.by;
     }
@@ -478,15 +478,17 @@ export class Store implements StatusView {
     if (this.laneMatches !== null) return this.laneMatches;
     const matches = new Map<AgentId, { by: AgentId; at: string | null; command: string }>();
     const used = new Set<string>();
-    const lanes = [...this.agents.values()].filter((agent) => agent.flavor.kind === "lane" && agent.fallbackParent !== null)
+    const lanes = [...this.agents.values()].filter((agent) => agent.flavor.kind === "lane")
       .sort((a, b) => (a.startedAt ?? "").localeCompare(b.startedAt ?? ""));
     for (const lane of lanes) {
       const calls = [...this.laneCalls].filter(([key, call]) => !used.has(key) &&
-        (call.by === lane.fallbackParent || this.agents.get(call.by)?.root === lane.fallbackParent));
-      const literal = [lane.receiptPath, lane.resultPath, lane.flavor.kind === "lane" ? lane.flavor.label : null]
+        (lane.fallbackParent === null
+          ? lane.harness === "opencode" && this.agents.get(call.by)?.harness === "opencode" && lane.cwd !== null && this.agents.get(call.by)?.cwd === lane.cwd
+          : call.by === lane.fallbackParent || this.agents.get(call.by)?.root === lane.fallbackParent));
+      const literal = [lane.receiptPath, lane.resultPath, lane.fallbackParent !== null && lane.flavor.kind === "lane" ? lane.flavor.label : null]
         .filter((value): value is string => value !== null && value.length > 0);
       let selected = calls.find(([, call]) => literal.some((value) => call.command.includes(value)));
-      if (selected === undefined && lane.startedAt !== null) {
+      if (selected === undefined && lane.fallbackParent !== null && lane.startedAt !== null) {
         const started = Date.parse(lane.startedAt);
         selected = calls.filter(([, call]) => {
           const at = call.at === null ? Number.NaN : Date.parse(call.at);

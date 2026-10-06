@@ -1,3 +1,4 @@
+import { openCodeAdapter } from "./adapters/opencode.ts";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Adapter } from "./adapter.ts";
@@ -13,6 +14,7 @@ const LANES_DIR_VAR = "PSTACK_FLEX_LANES_DIR";
 export interface Homes {
   readonly claude: string;
   readonly codex: string;
+  readonly opencode?: string;
   /** The runner's lane journal; it exists only while journaling is on. */
   readonly lanes: string;
   /** The monitor's own state: server record and log. */
@@ -29,11 +31,12 @@ export function homes(env: NodeJS.ProcessEnv = process.env): Homes {
   return {
     claude: configured(env, "CLAUDE_CONFIG_DIR") ?? join(home, ".claude"),
     codex: configured(env, "CODEX_HOME") ?? join(home, ".codex"),
+    opencode: join(configured(env, "XDG_DATA_HOME") ?? join(home, ".local", "share"), "opencode"),
     lanes: configured(env, LANES_DIR_VAR) ?? join(home, ".pstack-flex", "lanes"),
     state: configured(env, "PSF_MONITOR_DIR") ?? join(home, ".psf-monitor"),
   };
 }
 
 export function adapters(where: Homes): Adapter[] {
-  return [claudeAdapter(where.claude), codexAdapter(where.codex), laneAdapter(where.lanes)];
+  return [claudeAdapter(where.claude), codexAdapter(where.codex), ...(where.opencode === undefined ? [] : [openCodeAdapter(where.opencode)]), laneAdapter(where.lanes)];
 }

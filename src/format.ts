@@ -132,7 +132,7 @@ export function kindLabel(node: AgentNode): string {
   switch (node.flavor.kind) {
     case "skill": return `pstack skill · ${triggerPhrase(node.flavor.trigger.kind)}`;
     case "session":
-      return node.harness === "claude" ? "Claude Code session" : "Codex session";
+      return node.harness === "claude" ? "Claude Code session" : node.harness === "opencode" ? "OpenCode session" : "Codex session";
     case "subagent": {
       // Plugin agent types are namespaced, e.g. `pstack:poteto-agent`; the namespace adds nothing here.
       const type = node.flavor.agentType;

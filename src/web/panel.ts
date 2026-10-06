@@ -1,3 +1,4 @@
+import { MessageComposer } from "./messages.ts";
 import type { AgentId, AgentNode, Clipped, MessageLink, TimelineItem } from "../domain.ts";
 import { actionsFor, resumeCommand, type AgentActionId } from "../actions.ts";
 import { activityLine, ago, stalled, clockTime, compactNumber, duration, kindLabel, modelOf, prettyModel, shortPath, statusLine, summarizeInput } from "../format.ts";
@@ -14,34 +15,12 @@ const LOAD_OLDER_THRESHOLD = 160;
 const CLAMP_CHARS = 700;
 export const PANEL_MIN = 360;
 export const PANEL_DEFAULT = 460;
-const PANEL_WIDE = 760;
 const KEY_STEP = 24;
-const WIDTH_KEY = "psf-monitor.panel-width";
-
 export interface PanelEvents {
   close(): void;
   select(id: AgentId): void;
   loadOlder(agent: AgentId, before: number): Promise<TimelinePage | null>;
-  /** `settled` is false while a drag is still moving. */
   resized(width: number, settled: boolean): void;
-}
-
-function storedWidth(): number {
-  try {
-    const value = Number(localStorage.getItem(WIDTH_KEY));
-    return Number.isFinite(value) && value >= PANEL_MIN ? value : PANEL_DEFAULT;
-  } catch {
-    return PANEL_DEFAULT;
-  }
-}
-
-function storeWidth(width: number | null): void {
-  try {
-    if (width === null) localStorage.removeItem(WIDTH_KEY);
-    else localStorage.setItem(WIDTH_KEY, String(Math.round(width)));
-  } catch {
-    // Storage is unavailable; the width lasts for this page only.
-  }
 }
 
 type ToolCall = Extract<TimelineItem, { kind: "tool-call" }>;
@@ -66,6 +45,7 @@ function clippedNote(body: Clipped): HTMLElement | null {
 
 export class Panel {
   readonly element: HTMLElement;
+  private readonly composer = new MessageComposer();
   private readonly glyph: HTMLElement;
   private readonly title: HTMLElement;
   private readonly kind: HTMLElement;
@@ -90,7 +70,7 @@ export class Panel {
   private copiedUntil = 0;
   private copiedAgent: AgentId | null = null;
   private readonly widen: HTMLButtonElement;
-  private preferred = storedWidth();
+  private preferred: number | null = null;
   private maxWidth = Number.POSITIVE_INFINITY;
   private readonly scroller: HTMLElement;
   private readonly list: HTMLOListElement;
@@ -125,8 +105,8 @@ export class Panel {
     this.actionMessage = h("p", { class: "command-message", attrs: { hidden: "", role: "status" } });
     const close = h("button", { class: "icon-button", title: "Close", attrs: { type: "button", "aria-label": "Close agent details" } }, icon("close"));
     close.addEventListener("click", () => this.events.close());
-    this.widen = h("button", { class: "icon-button panel-widen", title: "Widen", attrs: { type: "button", "aria-label": "Widen panel", "aria-pressed": "false" } }, icon("widen"));
-    this.widen.addEventListener("click", () => this.setWidth(this.width >= PANEL_WIDE ? PANEL_DEFAULT : PANEL_WIDE, true));
+    this.widen = h("button", { class: "icon-button panel-widen", title: "Toggle full width", attrs: { type: "button", "aria-label": "Toggle full width panel", "aria-pressed": "false" } }, icon("widen"));
+    this.widen.addEventListener("click", () => this.setWidth(this.preferred === null ? PANEL_DEFAULT : null, true));
     const resizer = h("div", {
       class: "panel-resizer",
       title: "Drag to resize; double-click to reset",
@@ -137,7 +117,7 @@ export class Panel {
     this.olderButton.addEventListener("click", () => void this.loadOlder());
     this.list = h("ol", { class: "timeline-items" });
     this.emptyNote = h("p", { class: "timeline-empty", attrs: { hidden: "" } });
-    this.scroller = h("div", { class: "timeline", attrs: { tabindex: "0", "aria-label": "Activity" } }, this.steps, this.finalResponse, this.olderButton, this.list, this.emptyNote);
+    this.scroller = h("div", { class: "timeline", attrs: { tabindex: "0", "aria-label": "Activity" } }, this.composer.element, this.steps, this.finalResponse, this.olderButton, this.list, this.emptyNote);
     this.scroller.addEventListener("scroll", () => this.onScroll(), { passive: true });
     this.jump = h("button", { class: "jump", attrs: { type: "button", hidden: "" } }, icon("arrowDown"), h("span", { text: "New activity" }));
     this.jump.addEventListener("click", () => this.scrollToEnd(true));
@@ -167,25 +147,24 @@ export class Panel {
   }
 
   get width(): number {
-    return Math.max(PANEL_MIN, Math.min(this.preferred, this.maxWidth));
+    return Math.max(PANEL_MIN, Math.min(this.preferred ?? this.maxWidth, this.maxWidth));
   }
 
-  /** Keeps the panel from covering the whole stage; called when the window resizes. */
+  /** Tracks available space; a newly opened panel fills it. */
   setMaxWidth(pixels: number): void {
     this.maxWidth = Math.max(PANEL_MIN, pixels);
     this.applyWidth();
   }
 
   private setWidth(pixels: number | null, settled: boolean): void {
-    this.preferred = pixels ?? PANEL_DEFAULT;
-    if (settled) storeWidth(pixels === null ? null : this.width);
+    this.preferred = pixels;
     this.applyWidth();
     this.events.resized(this.width, settled);
   }
 
   private applyWidth(): void {
     this.element.style.setProperty("--panel-width", `${this.width}px`);
-    this.widen.setAttribute("aria-pressed", String(this.width >= PANEL_WIDE));
+    this.widen.setAttribute("aria-pressed", String(this.preferred === null));
   }
 
   private bindResizer(resizer: HTMLElement): void {
@@ -227,7 +206,9 @@ export class Panel {
 
   open(node: AgentNode, nodes: ReadonlyMap<AgentId, AgentNode>, now: number): void {
     const switched = this.agent?.id !== node.id;
+    this.preferred = null;
     this.agent = node;
+    this.composer.open(node.id);
     this.nodes = nodes;
     if (switched) {
       this.resultLoadedFor = null;
@@ -252,6 +233,7 @@ export class Panel {
   }
 
   close(): void {
+    this.composer.close();
     this.agent = null;
     this.element.dataset.open = "false";
   }

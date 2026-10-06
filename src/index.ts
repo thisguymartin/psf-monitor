@@ -85,6 +85,7 @@ export class Index {
   private readonly tracked = new Map<string, Tracked>();
   private readonly streams = new Map<AgentId, TrackedStream>();
   private readonly counters = new Map<SourceKind, Counters>();
+  private readonly snapshots = new Map<AgentId, string>();
   private busy = false;
   private indexing = true;
 
@@ -120,6 +121,7 @@ export class Index {
     try {
       if (full) await this.scan();
       else await this.poll();
+      this.readSnapshots();
     } finally {
       this.busy = false;
       this.indexing = false;
@@ -139,6 +141,10 @@ export class Index {
   }
 
   timeline(agent: AgentId, before: number | null, limit: number): TimelinePage | null {
+    for (const adapter of this.adapters) {
+      const page = adapter.timeline?.(agent, before, limit);
+      if (page != null) return page;
+    }
     const stream = this.streams.get(agent);
     if (stream === undefined) return null;
     const end = before === null ? stream.offset : Math.min(before, stream.offset);
@@ -187,6 +193,37 @@ export class Index {
   /** Every tracked file; used to route file events. */
   get paths(): readonly string[] {
     return [...this.tracked.keys()];
+  }
+
+  private readSnapshots(): void {
+    for (const adapter of this.adapters) {
+      if (adapter.snapshot === undefined) continue;
+      const counters = this.counters.get(adapter.source)!;
+      try {
+        const snapshot = adapter.snapshot(this.options.sinceMs);
+        counters.present = snapshot.present;
+        counters.files = snapshot.documents.length;
+        counters.lines = counters.parsed = counters.shape = counters.notJson = counters.oversized = 0;
+        counters.unknownTypes.clear();
+        counters.cliVersions.clear();
+        for (const document of snapshot.documents) {
+          const changed = this.snapshots.get(document.agent) !== document.stamp;
+          for (const record of document.records) this.record(adapter.source, document.agent, record, changed);
+          if (changed) {
+            this.snapshots.set(document.agent, document.stamp);
+            if (this.options.watched?.(document.agent)) {
+              const page = adapter.timeline?.(document.agent, null, 400);
+              if (page !== undefined && page !== null) this.options.onItems?.(document.agent, page.items);
+            }
+          }
+        }
+      } catch {
+        // An incompatible or temporarily locked database must not stop other sources.
+        counters.present = true;
+        counters.shape = 1;
+        counters.unknownTypes.set("database-read", 1);
+      }
+    }
   }
 
   private async scan(): Promise<void> {
@@ -338,7 +375,7 @@ export class Index {
     if (first !== undefined && first.offset === 0) parser.line(first.text, 0);
   }
 
-  private record(source: SourceKind, agent: AgentId | null, parsedLine: Parsed): void {
+  private record(source: SourceKind, agent: AgentId | null, parsedLine: Parsed, apply = true): void {
     const counters = this.counters.get(source)!;
     counters.lines += 1;
     if (parsedLine.cliVersion !== null) counters.cliVersions.add(parsedLine.cliVersion);
@@ -349,8 +386,8 @@ export class Index {
       counters.unknownTypes.set(issue.recordType, (counters.unknownTypes.get(issue.recordType) ?? 0) + 1);
     } else {
       counters.shape += 1;
-      if (agent !== null) this.store.noteShapeError(agent);
+      if (apply && agent !== null) this.store.noteShapeError(agent);
     }
-    for (const fact of parsedLine.facts) this.store.apply(fact);
+    if (apply) for (const fact of parsedLine.facts) this.store.apply(fact);
   }
 }

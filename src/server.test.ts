@@ -152,6 +152,15 @@ describe("data", () => {
     rmSync(output);
     expect((await handle(request(`/api/result?agent=${encodeURIComponent(lane)}`, authed))).status).toBe(404);
   });
+  it("serves the pstack setup behind the token", async () => {
+    const setup = { installs: [], skills: [], providers: [], sheets: [], defaults: [], settings: [], platform: "darwin" };
+    const withSetup = createHandler(monitor, { port: PORT, token: TOKEN, assets: { html: "", css: "", js: "" }, lanes: join(scratch, "lanes"), cancel: async () => ({ kind: "unknown-agent" }), stop: () => {}, setup: () => setup });
+    expect((await withSetup(request("/api/setup"))).status).toBe(401);
+    expect(await (await withSetup(request("/api/setup", authed))).json()).toEqual(setup);
+    expect((await withSetup(post("/api/setup", {}))).status).toBe(405);
+    expect((await handle(request("/api/setup", authed))).status).toBe(404);
+  });
+
   it("serves the snapshot", async () => {
     const snapshot = (await (await handle(request("/api/snapshot", authed))).json()) as Snapshot;
     expect(snapshot.server).toMatchObject({ app: "psf-monitor", indexing: false });
@@ -294,5 +303,34 @@ describe("commands", () => {
     expect(await response.json()).toEqual({ ok: true });
     await Bun.sleep(40);
     expect(stopped).toBe(true);
+  });
+});
+
+describe("message API", () => {
+  it("protects prompt delivery, validates input, and exposes receipts only for visible agents", async () => {
+    const { MessageInbox } = await import("./messages.ts");
+    const inbox = new MessageInbox(join(scratch, "message-state"));
+    const handler = createHandler(monitor, { port: PORT, token: TOKEN, assets: { html: "", css: "", js: "" }, lanes: join(scratch, "lanes"), cancel: async () => ({ kind: "unknown-agent" }), stop: () => {}, inbox });
+    try {
+      const body = { agent: "claude:s1", mode: "steer", text: "Use an expandable list." };
+      expect((await handler(post("/api/messages", body, { authorization: "" }))).status).toBe(401);
+      expect((await handler(post("/api/messages", body, { origin: "http://evil.example" }))).status).toBe(403);
+      expect((await handler(post("/api/messages", body, { origin: "" }))).status).toBe(403);
+      expect((await handler(post("/api/messages", { ...body, agent: "claude:s2" }))).status).toBe(404);
+      expect((await handler(post("/api/messages", { ...body, mode: "unknown" }))).status).toBe(400);
+      expect((await handler(post("/api/messages", { ...body, text: " " }))).status).toBe(400);
+      expect((await handler(post("/api/messages", { ...body, text: "x".repeat(2001) }))).status).toBe(400);
+      expect((await handler(post("/api/messages", body))).status).toBe(200);
+      const state = await (await handler(request("/api/messages?agent=claude:s1", authed))).json();
+      expect(state.target.id).toBe("claude:s1");
+      expect(state.connected).toBe(false);
+      expect(state.messages[0].text).toBe(body.text);
+      expect((await handler(request("/api/messages?agent=claude:s1"))).status).toBe(401);
+      expect(await (await handler(request("/api/messages?agent=claude:s2", authed))).json()).toEqual({ target: null, connected: false, messages: [] });
+      inbox.receive("claude:s1", false);
+      const delivered = await (await handler(request("/api/messages?agent=claude:s1", authed))).json();
+      expect(delivered.connected).toBe(true);
+      expect(delivered.messages[0].deliveredAt).not.toBeNull();
+    } finally { inbox.close(); }
   });
 });

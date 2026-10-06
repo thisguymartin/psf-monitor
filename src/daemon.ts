@@ -1,16 +1,20 @@
+import { MessageInbox } from "./messages.ts";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { closeSync, mkdirSync, openSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentNode, Harness } from "./domain.ts";
 import { cancelLane } from "./control.ts";
 import { diskFileSystem } from "./fs.ts";
+import { lockInstance } from "./instance-lock.ts";
 import { journalOn, pruneLanes } from "./journal.ts";
 import { Monitor } from "./monitor.ts";
 import { psTable } from "./probe.ts";
 import { clearRecord, readRecord, serverUrl, writeRecord, type ServerRecord } from "./record.ts";
 import { createHandler, type Assets } from "./server.ts";
+import { readSetup } from "./setup.ts";
 import { adapters, type Homes } from "./sources.ts";
 import { monitorVersion } from "./version.ts";
 import type { Snapshot } from "./wire.ts";
@@ -21,6 +25,7 @@ import type { Snapshot } from "./wire.ts";
 export const DEFAULT_PORT = 47317;
 const LAUNCHER = fileURLToPath(new URL("../bin/psf-monitor", import.meta.url));
 const POLL_INTERVAL_MS = 100;
+const START_TIMEOUT_MS = 20_000;
 
 export interface Io {
   readonly stdout: (value: string) => void;
@@ -49,7 +54,7 @@ interface Health {
 
 async function health(port: number): Promise<Health | null> {
   try {
-    const response = await fetch(`http://127.0.0.1:${port}/api/health`);
+    const response = await fetch(`http://127.0.0.1:${port}/api/health`, { signal: AbortSignal.timeout(1_500) });
     if (!response.ok) return null;
     const body = (await response.json()) as Partial<Health>;
     return body.app === "psf-monitor" && typeof body.instance === "string" ? (body as Health) : null;
@@ -87,8 +92,46 @@ function logTail(path: string): string {
   }
 }
 
-/** Runs the server in the foreground until SIGINT or SIGTERM. */
+/** The setup as this process sees it: its own environment and PATH. */
+export function diskSetup(where: Homes) {
+  return readSetup({ where, fs: diskFileSystem, env: process.env, which: (command) => Bun.which(command), home: homedir(), platform: process.platform });
+}
+
+async function runningRecord(where: Homes): Promise<ServerRecord | null> {
+  const record = readRecord(where.state);
+  if (record === null) return null;
+  const running = await health(record.port);
+  return running?.instance === record.instance && running.pid === record.pid ? record : null;
+}
+
+function reportRunning(record: ServerRecord, io: Io): void {
+  io.stderr(`psf-monitor is already running globally (PID ${record.pid}, port ${record.port}); using the existing monitor.\n`);
+  if (record.version !== monitorVersion()) io.stderr("The running monitor uses a different build. Run `psf-monitor stop` then `psf-monitor start` to update it.\n");
+}
+
+/** One server per user state directory, including foreground and concurrent launches. */
 export async function serve(where: Homes, options: ServeOptions, io: Io): Promise<number> {
+  const deadline = Date.now() + START_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const existing = await runningRecord(where);
+    if (existing !== null) { reportRunning(existing, io); return 0; }
+    const release = lockInstance(where.state);
+    if (release !== null) {
+      try {
+        // An older build may own the record without taking the instance lock.
+        const running = await runningRecord(where);
+        if (running !== null) { reportRunning(running, io); return 0; }
+        return await serveLocked(where, options, io);
+      } finally { release(); }
+    }
+    await Bun.sleep(POLL_INTERVAL_MS);
+  }
+  io.stderr("Another psf-monitor is starting or not responding. Check `psf-monitor status` and the server log.\n");
+  return 69;
+}
+
+/** Runs while holding the instance lock, until SIGINT, SIGTERM, or a stop request. */
+async function serveLocked(where: Homes, options: ServeOptions, io: Io): Promise<number> {
   const pruned = pruneLanes(where.lanes, Date.now());
   if (pruned > 0) io.stdout(`removed ${pruned} lane ${pruned === 1 ? "journal" : "journals"} older than 7 days\n`);
   const version = monitorVersion();
@@ -105,41 +148,51 @@ export async function serve(where: Homes, options: ServeOptions, io: Io): Promis
   });
   let resolveStopped: () => void = () => {};
   const stopped = new Promise<void>((resolve) => { resolveStopped = resolve; });
+  const inbox = new MessageInbox(where.state);
   const handler = createHandler(monitor, {
+    inbox,
     port: options.port,
     token,
     assets: await options.assets(),
     lanes: where.lanes,
     cancel: (id) => cancelLane(monitor.store, psTable, id),
+    setup: () => diskSetup(where),
     stop: resolveStopped,
   });
   let server: ReturnType<typeof Bun.serve>;
   try {
     server = Bun.serve({ hostname: "127.0.0.1", port: options.port, fetch: (request, bun) => handler(request, bun) });
   } catch (error) {
+    inbox.close();
     io.stderr(`port ${options.port} is unavailable: ${error instanceof Error ? error.message : String(error)}\n`);
     return 69;
   }
-  writeRecord(where.state, {
-    pid: process.pid,
-    port: options.port,
-    token,
-    version,
-    instance,
-    startedAt: new Date().toISOString(),
-  });
-  io.stdout(`psf-monitor ${version} serving ${serverUrl({ port: options.port })}\n`);
   process.once("SIGTERM", resolveStopped);
   process.once("SIGINT", resolveStopped);
-  await monitor.start();
-  await stopped;
-  monitor.stop();
-  server.stop(true);
-  clearRecord(where.state, instance);
-  return 0;
+  try {
+    writeRecord(where.state, {
+      pid: process.pid,
+      port: options.port,
+      token,
+      version,
+      instance,
+      startedAt: new Date().toISOString(),
+    });
+    io.stdout(`psf-monitor ${version} serving ${serverUrl({ port: options.port })} · all projects\n`);
+    await monitor.start();
+    await stopped;
+    return 0;
+  } finally {
+    monitor.stop();
+    inbox.close();
+    server.stop(true);
+    clearRecord(where.state, instance);
+    process.removeListener("SIGTERM", resolveStopped);
+    process.removeListener("SIGINT", resolveStopped);
+  }
 }
 
-/** Starts the daemon, or reuses one that runs this exact build, and prints its link. */
+/** Starts the global daemon, or reports the existing one and prints its link. */
 export async function start(where: Homes, options: StartOptions, io: Io): Promise<number> {
   // Watching agents means wanting external lanes too; say so the first time, since lane output is kept on disk.
   if (journalOn(where.lanes) === "enabled") {
@@ -148,19 +201,11 @@ export async function start(where: Homes, options: StartOptions, io: Io): Promis
         "`psf-monitor journal off` stops it and deletes them.\n",
     );
   }
-  const version = monitorVersion();
-  const existing = readRecord(where.state);
+  const existing = await runningRecord(where);
   if (existing !== null) {
-    const running = await health(existing.port);
-    if (running?.instance === existing.instance) {
-      if (running.version === version) {
-        io.stdout(`${launchUrl(existing, options.harness, options.focus)}\n`);
-        return 0;
-      }
-      io.stderr(`replacing psf-monitor ${running.version} with ${version}\n`);
-      process.kill(running.pid, "SIGTERM");
-      await waitForExit(running.pid);
-    }
+    reportRunning(existing, io);
+    io.stdout(`${launchUrl(existing, options.harness, options.focus)}\n`);
+    return 0;
   }
 
   mkdirSync(where.state, { recursive: true, mode: 0o700 });
@@ -170,28 +215,37 @@ export async function start(where: Homes, options: StartOptions, io: Io): Promis
     process.execPath,
     [LAUNCHER, "serve", "--port", String(options.port), "--hours", String(options.windowHours)],
     // Detached with its output in a file, so the caller's shell or tool call returns at once.
-    { detached: true, stdio: ["ignore", log, log], env: process.env },
+    { detached: true, stdio: ["ignore", log, log], env: {
+      ...process.env, CLAUDE_CONFIG_DIR: where.claude, CODEX_HOME: where.codex,
+      PSTACK_FLEX_LANES_DIR: where.lanes, PSF_MONITOR_DIR: where.state,
+    } },
   );
   closeSync(log);
   let exitCode: number | null = null;
+  let spawnError: string | null = null;
+  child.once("error", (error) => { spawnError = error.message; });
   child.once("exit", (code) => {
     exitCode = code ?? 1;
   });
   child.unref();
 
-  // The server either becomes healthy or exits; there is no deadline to invent.
-  for (;;) {
-    if (exitCode !== null) {
-      io.stderr(`psf-monitor exited before it was ready (status ${exitCode}). Log: ${logPath}\n${logTail(logPath)}\n`);
-      return 69;
-    }
-    const record = readRecord(where.state);
-    if (record !== null && record.pid === child.pid && (await health(record.port))?.instance === record.instance) {
+  const deadline = Date.now() + START_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    // A concurrent launcher may have won; both callers get the same live instance.
+    const record = await runningRecord(where);
+    if (record !== null) {
+      if (record.pid !== child.pid) reportRunning(record, io);
       io.stdout(`${launchUrl(record, options.harness, options.focus)}\n`);
       return 0;
     }
+    if (spawnError !== null || exitCode !== null) {
+      io.stderr(`psf-monitor exited before it was ready (${spawnError ?? `status ${exitCode}`}). Log: ${logPath}\n${logTail(logPath)}\n`);
+      return 69;
+    }
     await Bun.sleep(POLL_INTERVAL_MS);
   }
+  io.stderr(`psf-monitor is still starting or not responding. Check \`psf-monitor status\`. Log: ${logPath}\n`);
+  return 69;
 }
 
 export async function stop(where: Homes, io: Io): Promise<number> {

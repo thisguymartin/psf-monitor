@@ -23,7 +23,7 @@ export const AGENT_ACTIONS: readonly AgentAction[] = [
     label: "Copy resume command",
     runs: "client",
     confirm: null,
-    available: (node) => node.flavor.kind === "session" && (node.harness === "claude" || node.harness === "codex"),
+    available: (node) => node.flavor.kind === "session" && (node.harness === "claude" || node.harness === "codex" || node.harness === "opencode"),
   },
 ];
 
@@ -41,6 +41,6 @@ export function resumeCommand(node: AgentNode): string | null {
   if (!node.id.startsWith(prefix)) return null;
   const session = node.id.slice(prefix.length);
   if (!/^[A-Za-z0-9_-]+$/.test(session)) return null;
-  const command = node.harness === "claude" ? `claude --resume ${session}` : `codex resume ${session}`;
+  const command = node.harness === "claude" ? `claude --resume ${session}` : node.harness === "opencode" ? `opencode --session ${session}` : `codex resume ${session}`;
   return node.cwd === null ? command : `cd '${node.cwd.replaceAll("'", "'\\''")}' && ${command}`;
 }

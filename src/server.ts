@@ -1,11 +1,12 @@
 import { timingSafeEqual } from "node:crypto";
 import { open } from "node:fs/promises";
+import { MessageInbox, messageTarget } from "./messages.ts";
 import { AGENT_ACTIONS } from "./actions.ts";
 import type { CancelResult } from "./control.ts";
 import type { AgentId } from "./domain.ts";
 import { journalEnabled, journalOff, journalOn } from "./journal.ts";
 import { FIRST_PAGE, type Monitor } from "./monitor.ts";
-import type { ServerEvent } from "./wire.ts";
+import type { PstackSetup, ServerEvent } from "./wire.ts";
 
 // The monitor's HTTP surface. Loopback only, with a per-start token.
 
@@ -26,6 +27,9 @@ export interface HandlerOptions {
   readonly assets: Assets;
   readonly lanes: string;
   readonly cancel: (id: AgentId) => Promise<CancelResult>;
+  /** Reads how pstack is set up; absent where no one asks. */
+  readonly setup?: () => PstackSetup;
+  readonly inbox?: MessageInbox;
   readonly stop: () => void;
 }
 
@@ -137,12 +141,24 @@ export function createHandler(monitor: Monitor, options: HandlerOptions) {
 
     if (request.method === "POST") {
       if (!origins.has(origin ?? "")) return plain(403, "origin required");
-      if (url.pathname !== "/api/action" && url.pathname !== "/api/journal" && url.pathname !== "/api/stop") return plain(405, "method not allowed");
+      if (url.pathname !== "/api/messages" && url.pathname !== "/api/action" && url.pathname !== "/api/journal" && url.pathname !== "/api/stop") return plain(405, "method not allowed");
       let body: unknown;
       try {
         body = await readJson(request);
       } catch (error) {
         return json({ ok: false, message: error instanceof Error ? error.message : "Invalid request." }, 400);
+      }
+      if (url.pathname === "/api/messages") {
+        if (!object(body) || typeof body.agent !== "string" || agentParam(body.agent) === null) return json({ ok: false, message: "Expected agent." }, 400);
+        const target = messageTarget(monitor.store, body.agent as AgentId);
+        if (target === null) return json({ ok: false, message: "No supported recipient for this agent." }, 404);
+        if (options.inbox === undefined) return json({ ok: false, message: "Message inbox unavailable. Restart the monitor." }, 503);
+        if (typeof body.cancel === "string") return json({ ok: options.inbox.cancel(target.id, body.cancel), message: "Queued message removed, or already delivered." });
+        if ((body.mode !== "steer" && body.mode !== "follow-up") || typeof body.text !== "string" || body.text.trim().length === 0 || body.text.length > 2000) return json({ ok: false, message: "Choose a delivery mode and enter 1–2000 characters." }, 400);
+        try {
+          options.inbox.enqueue(target.id, body.agent, body.mode, body.text.trim());
+          return json({ ok: true, message: "Message queued." });
+        } catch (error) { return json({ ok: false, message: error instanceof Error ? error.message : "Could not queue message." }, 409); }
       }
       if (url.pathname === "/api/action") {
         if (!object(body) || typeof body.agent !== "string" || agentParam(body.agent) === null || typeof body.action !== "string") {
@@ -183,7 +199,7 @@ export function createHandler(monitor: Monitor, options: HandlerOptions) {
     switch (url.pathname) {
       case "/": {
         // Theme the first paint from the link, so a Codex session never flashes orange.
-        const harness = url.searchParams.get("harness") === "codex" ? "codex" : "claude";
+        const harness = url.searchParams.get("harness") === "codex" ? "codex" : url.searchParams.get("harness") === "opencode" ? "opencode" : "claude";
         const html = options.assets.html.replace('data-harness="claude"', `data-harness="${harness}"`);
         return respond(200, html, { "Content-Type": "text/html; charset=utf-8" });
       }
@@ -193,6 +209,15 @@ export function createHandler(monitor: Monitor, options: HandlerOptions) {
         return respond(200, options.assets.css, { "Content-Type": "text/css; charset=utf-8" });
       case "/api/snapshot":
         return json(monitor.snapshot());
+      case "/api/messages": {
+        const agent = agentParam(url.searchParams.get("agent"));
+        const target = agent === null ? null : messageTarget(monitor.store, agent);
+        if (target === null) return json({ target: null, connected: false, messages: [] });
+        if (options.inbox === undefined) return plain(503, "message inbox unavailable");
+        return json({ target: { id: target.id, title: target.title }, connected: options.inbox.connected(target.id), messages: options.inbox.list(target.id) });
+      }
+      case "/api/setup":
+        return options.setup === undefined ? plain(404, "not found") : json(options.setup());
       case "/api/result": {
         const agent = agentParam(url.searchParams.get("agent"));
         const path = agent === null ? null : monitor.resultPath(agent);

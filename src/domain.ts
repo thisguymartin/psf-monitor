@@ -6,13 +6,13 @@ import type { AccessMode, NormalizedUsage, ReceiptStatus } from "./pstack.ts";
 declare const brand: unique symbol;
 type Brand<T, B extends string> = T & { readonly [brand]: B };
 
-/** `claude:<session>`, `claude:<session>:<agent>`, `codex:<thread>`, `lane:<lane>`, or `skill:<runner agent id>/<call id or record uuid>`. */
+/** `claude:<session>`, `claude:<session>:<agent>`, `codex:<thread>`, `opencode:<session>`, `lane:<lane>`, or `skill:<runner agent id>/<call id or record uuid>`. */
 export type AgentId = Brand<string, "AgentId">;
 /** `<byteOffset>.<index>` of the record an item came from, in its agent's file. */
 export type ItemId = Brand<string, "ItemId">;
 
-export type Harness = "claude" | "codex";
-export type SourceKind = "claude-session" | "codex-rollout" | "runner-lane";
+export type Harness = "claude" | "codex" | "opencode";
+export type SourceKind = "claude-session" | "codex-rollout" | "opencode-session" | "runner-lane";
 export type Health = "ok" | "degraded";
 
 export type AgentStatus =

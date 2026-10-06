@@ -41,6 +41,13 @@ describe("claim", () => {
 });
 
 describe("lane record", () => {
+  it("accepts OpenCode parents without a session environment variable", () => {
+    const parsed = adapter.document(join(dir, "lane.json"), JSON.stringify({ ...record, parent: "opencode", parentSessionId: null, provider: "opencode" }));
+    expect(parsed.problem).toBeNull();
+    expect(parsed.facts[0]).toMatchObject({ kind: "agent", patch: { harness: "opencode", provider: "opencode", flavor: { stream: "live" } } });
+    expect(parsed.facts.some((fact) => fact.kind === "link")).toBe(false);
+  });
+
   it("names the lane, links it to the parent session, and records the runner process", () => {
     const parsed = adapter.document(join(dir, "lane.json"), JSON.stringify(record));
     expect(parsed.problem).toBeNull();
@@ -96,6 +103,20 @@ describe("lane record", () => {
 
   it("rejects a record without the fields it needs", () => {
     expect(adapter.document(join(dir, "lane.json"), JSON.stringify({ provider: "codex" })).problem).toMatchObject({ kind: "shape" });
+  });
+});
+
+describe("OpenCode lane JSON events", () => {
+  it("reads text, tools, step usage and errors from the CLI stream", () => {
+    const parser = adapter.open(join(dir, "stream.jsonl"));
+    const event = (type: string, part: unknown, offset: number) => parser.line(JSON.stringify({ type, timestamp: 1791194400000, sessionID: "ses_lane", part }), offset);
+    expect(event("step_start", { type: "step-start" }, 0).problem).toBeNull();
+    expect(event("text", { type: "text", text: "Inspecting" }, 100).items[0]).toMatchObject({ kind: "text", body: { text: "Inspecting" } });
+    const tool = event("tool_use", { type: "tool", tool: "bash", callID: "c1", state: { status: "completed", input: { command: "ls" }, output: "README.md" } }, 200);
+    expect(tool.problem).toBeNull();
+    expect(tool.items.map((item) => item.kind)).toEqual(["tool-call", "tool-result"]);
+    expect(event("step_finish", { type: "step-finish", id: "step1", tokens: { input: 100, output: 5, reasoning: 2, cache: { read: 20, write: 0 } } }, 300).facts[0]).toMatchObject({ kind: "usage", usage: { inputTokens: 100, outputTokens: 5, cachedInputTokens: 20 } });
+    expect(parser.line(JSON.stringify({ type: "error", error: { data: { message: "Provider unavailable" } } }), 400).items[0]).toMatchObject({ kind: "notice", level: "error", text: "Provider unavailable" });
   });
 });
 

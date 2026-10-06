@@ -71,7 +71,7 @@ export type Fact =
   | { readonly kind: "spawn-call"; readonly by: AgentId; readonly callId: string }
   | { readonly kind: "lane-call"; readonly by: AgentId; readonly callId: string; readonly at: string | null; readonly command: string }
   | { readonly kind: "current-skill"; readonly agent: AgentId; readonly run: AgentId | null }
-  | { readonly kind: "result"; readonly id: AgentId; readonly result: Result }
+  | { readonly kind: "result"; readonly id: AgentId; readonly result: Result | null }
   // `key` is unique per message, so a message seen twice counts once.
   | {
       readonly kind: "message";
@@ -173,6 +173,16 @@ export interface Root {
   readonly processRecords?: Harness;
 }
 
+export interface SourceDocument {
+  readonly agent: AgentId;
+  readonly stamp: string;
+  readonly records: readonly Parsed[];
+}
+export interface SourceSnapshot {
+  readonly present: boolean;
+  readonly documents: readonly SourceDocument[];
+}
+
 export interface Adapter {
   readonly source: SourceKind;
   readonly roots: readonly Root[];
@@ -180,6 +190,9 @@ export interface Adapter {
   readonly windowed: boolean;
   /** Newest CLI version the adapter was checked against; newer versions are flagged. */
   readonly checkedVersion: string | null;
+  /** Database-backed sources return immutable parsed session snapshots. */
+  readonly snapshot?: (sinceMs: number) => SourceSnapshot;
+  readonly timeline?: (agent: AgentId, before: number | null, limit: number) => import("./wire.ts").TimelinePage | null;
   claim(path: string): Claim | null;
   open(path: string): LineParser;
   document(path: string, text: string): Parsed;

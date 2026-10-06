@@ -2,7 +2,7 @@
 // reads it; the writer is pstack-flex's runner/flex-journal.ts, and the two
 // change together. Types only, because the browser bundle imports this file.
 
-export type Parent = "claude" | "codex";
+export type Parent = "claude" | "codex" | "opencode";
 export type AccessMode = "read-only" | "isolated-write";
 
 export type ReceiptStatus =

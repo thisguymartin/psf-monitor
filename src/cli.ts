@@ -1,9 +1,10 @@
 import { parseArgs as parseNodeArgs } from "node:util";
 import { buildAssets } from "./assets.ts";
-import { DEFAULT_PORT, serve, start, status, stop, type Io } from "./daemon.ts";
+import { DEFAULT_PORT, diskSetup, serve, start, status, stop, type Io } from "./daemon.ts";
 import { diagnose, renderReport } from "./doctor.ts";
 import type { Harness } from "./domain.ts";
 import { journalEnabled, journalOff, journalOn } from "./journal.ts";
+import { renderSetup } from "./setup.ts";
 import { homes, type Homes } from "./sources.ts";
 
 // Entry point for `psf-monitor`.
@@ -11,21 +12,24 @@ import { homes, type Homes } from "./sources.ts";
 const HELP = `Usage: psf-monitor <command> [options]
 
 Commands:
-  start     Start the monitor, or reuse the running one, and print its link.
+  start     Start the global monitor, or report the running one and print its link.
   status    Print a one-line summary and the link.
   stop      Stop the monitor. Agents keep running.
   doctor    Report how well recent transcripts parsed (counts only).
+  setup     List pstack's skills, providers, model roles, and settings.
   journal <on|off|status>
             Record external lanes for the monitor. \`off\` deletes the records.
   serve     Run the server in the foreground.
 
 Options:
-  --parent <claude|codex>  The harness asking: sets the theme and focuses its session.
+  --parent <claude|codex|opencode>  The harness asking: sets the theme and focuses its session.
   --focus <session id>     Session to select first.
   --port <n>               Port on 127.0.0.1 (default ${DEFAULT_PORT}).
   --hours <n>              How far back to index (default 24).
   -h, --help               Show this help.
 
+One monitor covers all projects in the configured harness directories.
+Repeat starts reuse it, including when --port or --hours differs.
 The monitor runs until \`psf-monitor stop\`.
 `;
 
@@ -36,7 +40,7 @@ const defaultIo: Io = {
 
 class UsageError extends Error {}
 
-const COMMANDS = ["start", "status", "stop", "doctor", "journal", "serve"] as const;
+const COMMANDS = ["start", "status", "stop", "doctor", "setup", "journal", "serve"] as const;
 type Command = (typeof COMMANDS)[number];
 const JOURNAL_ACTIONS = ["on", "off", "status"] as const;
 type JournalAction = (typeof JOURNAL_ACTIONS)[number];
@@ -86,8 +90,8 @@ export function parseArgs(argv: readonly string[], env: NodeJS.ProcessEnv = proc
   if (!Number.isInteger(port) || port > 65_535) throw new UsageError("--port must be an integer port number");
   const hours = positiveNumber("hours", parsed.values.hours, 24);
   const parent = parsed.values.parent;
-  if (parent !== undefined && parent !== "claude" && parent !== "codex") {
-    throw new UsageError("--parent must be claude or codex");
+  if (parent !== undefined && parent !== "claude" && parent !== "codex" && parent !== "opencode") {
+    throw new UsageError("--parent must be claude, codex, or opencode");
   }
   const harness = parent ?? null;
   const focusValue = typeof parsed.values.focus === "string" && parsed.values.focus.length > 0 ? parsed.values.focus : null;
@@ -148,6 +152,9 @@ export async function main(
       return journal(where, options.journal, io);
     case "serve":
       return serve(where, { port: options.port, windowHours: options.hours, assets: buildAssets }, io);
+    case "setup":
+      io.stdout(renderSetup(diskSetup(where)));
+      return 0;
     case "doctor": {
       const report = await diagnose(where, Date.now() - options.hours * 3_600_000);
       io.stdout(renderReport(report, options.hours));

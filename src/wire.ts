@@ -1,4 +1,4 @@
-import type { AgentId, AgentNode, Health, MessageLink, SourceKind, TimelineItem } from "./domain.ts";
+import type { AgentId, AgentNode, Harness, Health, MessageLink, SourceKind, TimelineItem } from "./domain.ts";
 import type { AgentActionId } from "./actions.ts";
 
 // The JSON shapes the server sends the browser.
@@ -80,3 +80,100 @@ export type ServerEvent =
   | { readonly event: "delta"; readonly data: Delta }
   | { readonly event: "timeline"; readonly data: TimelinePage }
   | { readonly event: "append"; readonly data: TimelineAppend };
+
+// --- pstack setup -----------------------------------------------------------
+
+export interface PstackInstall {
+  readonly harness: Harness;
+  readonly version: string | null;
+  readonly path: string;
+}
+
+export interface SkillInfo {
+  readonly name: string;
+  readonly description: string;
+  /** False for the principle leaves a skill reads by path; nobody types those. */
+  readonly invocable: boolean;
+}
+
+/** One row of pstack's model matrix: a `(provider, model)` pair with its own effort. */
+export interface ModelFamily {
+  readonly family: string;
+  readonly model: string;
+  readonly defaultEffort: string;
+  readonly efforts: readonly string[];
+}
+
+/** What the lane runner would find for a provider that runs on an API key. Never carries the key. */
+export interface GatewaySetup {
+  readonly keyVar: string;
+  readonly keySet: boolean;
+  readonly baseUrlVar: string;
+  readonly baseUrl: string;
+  readonly baseUrlOverridden: boolean;
+  readonly configDirVar: string;
+  readonly configDir: string;
+  readonly configDirOverridden: boolean;
+  readonly maxContextVar: string;
+  readonly maxContext: string | null;
+  /** A claude.ai login in the config dir makes the runner refuse the lane. */
+  readonly login: "none" | "found" | "unreadable";
+}
+
+export interface ProviderSetup {
+  readonly provider: string;
+  readonly kind: "subscription" | "gateway";
+  /** The binary the lane runner starts for this provider. */
+  readonly cli: string;
+  readonly cliPath: string | null;
+  readonly families: readonly ModelFamily[];
+  readonly gateway: GatewaySetup | null;
+  /** Null when a lane could start; otherwise what stops it. */
+  readonly blocked: string | null;
+}
+
+export interface SheetRole {
+  readonly role: string;
+  /** `provider:model@effort`, `inherit-parent`, or `auto`; one lane per entry. */
+  readonly lanes: readonly string[];
+}
+
+export interface ModelSheet {
+  readonly harness: Harness;
+  readonly path: string;
+  readonly present: boolean;
+  readonly roles: readonly SheetRole[];
+}
+
+export interface SetupSetting {
+  readonly variable: string;
+  readonly value: string;
+  readonly overridden: boolean;
+  readonly meaning: string;
+}
+
+export interface PstackSetup {
+  readonly installs: readonly PstackInstall[];
+  readonly skills: readonly SkillInfo[];
+  readonly providers: readonly ProviderSetup[];
+  readonly sheets: readonly ModelSheet[];
+  /** The roles pstack uses until a sheet is written. */
+  readonly defaults: readonly SheetRole[];
+  readonly settings: readonly SetupSetting[];
+  readonly platform: string;
+}
+
+export type PromptMode = "steer" | "follow-up";
+export interface PromptMessage {
+  readonly id: string;
+  readonly source: string;
+  readonly mode: PromptMode;
+  readonly text: string;
+  readonly queuedAt: number;
+  readonly deliveredAt: number | null;
+}
+export interface MessageState {
+  readonly target: { readonly id: string; readonly title: string } | null;
+  readonly connected: boolean;
+  readonly messages: readonly PromptMessage[];
+}

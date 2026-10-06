@@ -1,3 +1,4 @@
+import { openCodePart } from "./opencode-parts.ts";
 import { relative, sep } from "node:path";
 import type { LaneRecord, ReceiptStatus, RunnerReceipt } from "../pstack.ts";
 import {
@@ -24,7 +25,7 @@ export function laneId(lane: string): AgentId {
 
 /** Providers whose CLI streams events while it works; the rest print one result at exit. */
 function streams(provider: string): boolean {
-  return provider === "codex" || provider === "grok";
+  return provider === "codex" || provider === "grok" || provider === "opencode";
 }
 
 function outcomeOf(status: ReceiptStatus): Outcome {
@@ -72,6 +73,14 @@ class StreamParser implements LineParser {
     const type = text(event.type) ?? "?";
     if (type.startsWith("item.")) return this.item(type, object(event.item), offset);
     switch (type) {
+      case "text":
+      case "reasoning":
+      case "tool_use":
+      case "step_start":
+      case "step_finish": {
+        const part = object(event.part);
+        return openCodePart(this.agent, part === null ? null : { ...part, type: type === "tool_use" ? "tool" : type.replaceAll("_", "-") }, offset, typeof event.timestamp === "number" && Number.isFinite(event.timestamp) && Math.abs(event.timestamp) <= 8.64e15 ? new Date(event.timestamp).toISOString() : null);
+      }
       case "thread.started":
       case "turn.started":
       case "system":
@@ -82,7 +91,7 @@ class StreamParser implements LineParser {
       }
       case "turn.failed":
       case "error": {
-        const message = text(object(event.error)?.message) ?? text(event.message) ?? "the lane reported an error";
+        const message = text(object(object(event.error)?.data)?.message) ?? text(object(event.error)?.message) ?? text(event.message) ?? "the lane reported an error";
         return parsed([], [{ id: itemId(offset, 0), at: null, kind: "notice", level: "error", text: oneLine(message, 400) }]);
       }
       case "assistant": {
@@ -237,7 +246,7 @@ export function laneAdapter(root: string): Adapter {
 
 function laneRecord(path: string, id: AgentId, record: Partial<LaneRecord>): Parsed {
   const provider = text(record.provider);
-  const parent = record.parent === "claude" || record.parent === "codex" ? record.parent : null;
+  const parent = record.parent === "claude" || record.parent === "codex" || record.parent === "opencode" ? record.parent : null;
   const pid = finite(record.runnerPid);
   if (provider === null || parent === null || pid === undefined) {
     return problem({ kind: "shape", recordType: "lane.json", detail: "missing provider, parent, or runner pid" });

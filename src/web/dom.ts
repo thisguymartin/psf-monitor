@@ -82,6 +82,8 @@ const ICONS = {
   arrowDown: ["M12 5v14", "m6 13 6 6 6-6"],
   arrowRight: ["M5 12h14", "m13 6 6 6-6 6"],
   widen: ["M9 5H4v14h5", "M15 5h5v14h-5", "m7 12 3-3", "m7 12 3 3", "m17 12-3-3", "m17 12-3 3"],
+  copy: ["M9 9h10.5v11.5H9Z", "M5 15V4.5h10"],
+  sliders: ["M4 7h9", "M17 7h3", "M4 17h3", "M11 17h9", "M15 4.5v5", "M9 14.5v5"],
   folder: ["M3.5 6.5a1.5 1.5 0 0 1 1.5-1.5h4l2 2.5h8a1.5 1.5 0 0 1 1.5 1.5v8.5a1.5 1.5 0 0 1-1.5 1.5H5a1.5 1.5 0 0 1-1.5-1.5Z"],
 } as const;
 
@@ -117,6 +119,7 @@ export function logo(): SVGSVGElement {
 
 export function providerIcon(provider: string): IconName {
   switch (provider) {
+    case "opencode": return "terminal";
     case "claude":
     case "codex":
     case "grok":

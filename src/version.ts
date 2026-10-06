@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // A version that changes whenever the installed monitor
-// code changes, so `start` can replace a server left over from another build.
+// code changes, so `start` can report a server left over from another build.
 
 const MONITOR_DIR = fileURLToPath(new URL(".", import.meta.url));
 const PLUGIN_DIR = join(MONITOR_DIR, "..");

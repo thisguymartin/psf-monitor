@@ -1,0 +1,17 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "side-tab",
+        "value": "*",
+        "files": [
+          "src/web/app.css"
+        ],
+        "createdAt": "2026-10-05T23:39:06.193Z",
+        "reason": "Agent reviewed: the sole finding is the pre-existing .markdown blockquote quotation marker, not a decorative card accent; confirmed unchanged from HEAD."
+      }
+    ]
+  }
+}

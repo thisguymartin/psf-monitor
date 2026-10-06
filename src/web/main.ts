@@ -1,12 +1,14 @@
 import type { AgentId, AgentNode, Harness, MessageLink, SourceKind } from "../domain.ts";
 import { compactNumber, shortPath, working } from "../format.ts";
 import { countsOf, isLive, rootOf, rootsOf, treeOf, withoutSkills } from "../graph.ts";
-import type { Delta, JournalResponse, ServerInfo, Snapshot, SourceHealth, TimelineAppend, TimelinePage } from "../wire.ts";
+import type { Delta, JournalResponse, PstackSetup, ServerInfo, Snapshot, SourceHealth, TimelineAppend, TimelinePage } from "../wire.ts";
 import { Canvas } from "./canvas.ts";
+import { Explorer } from "./explorer.ts";
 import { postJson } from "./commands.ts";
 import { h, icon, logo } from "./dom.ts";
 import { Panel, PANEL_MIN } from "./panel.ts";
 import { Rail, type Descendants } from "./rail.ts";
+import { SetupView } from "./setup.ts";
 
 // The page controller: one event stream, one state,
 // and a render that every view reads from.
@@ -14,13 +16,13 @@ import { Rail, type Descendants } from "./rail.ts";
 const SOURCE_NAME: Record<SourceKind, string> = {
   "claude-session": "Claude Code",
   "codex-rollout": "Codex",
+  "opencode-session": "OpenCode",
   "runner-lane": "pstack lanes",
 };
 
 const RETRY_MS = 3_000;
 /** Canvas kept visible beside the panel; narrower than this and the panel overlays it. */
 const CANVAS_MIN = 360;
-const PANEL_GUTTER = 240;
 const SKILLS_KEY = "psf-monitor.skills-shown";
 
 function storedSkillsShown(): boolean {
@@ -34,6 +36,8 @@ function storeSkillsShown(shown: boolean): void {
 }
 
 type Connection = "connecting" | "live" | "retrying" | "expired" | "stopped";
+type View = "sessions" | "setup";
+const SETUP_HASH = "#setup";
 
 interface State {
   nodes: Map<AgentId, AgentNode>;
@@ -44,10 +48,13 @@ interface State {
   agent: AgentId | null;
   connection: Connection;
   dismissed: string;
+  view: View;
+  setup: PstackSetup | null;
+  setupError: string | null;
 }
 
 const params = new URLSearchParams(location.search);
-const defaultHarness: Harness = params.get("harness") === "codex" ? "codex" : "claude";
+const defaultHarness: Harness = params.get("harness") === "codex" ? "codex" : params.get("harness") === "opencode" ? "opencode" : "claude";
 let pendingFocus = params.get("focus") as AgentId | null;
 
 const state: State = {
@@ -59,26 +66,34 @@ const state: State = {
   agent: null,
   connection: "connecting",
   dismissed: "",
+  view: location.hash === SETUP_HASH ? "setup" : "sessions",
+  setup: null,
+  setupError: null,
 };
 
 let skillsShown = storedSkillsShown();
 
-const canvas = new Canvas({ select: (id) => selectAgent(id), toggleSkills: () => {
-  skillsShown = !skillsShown;
-  storeSkillsShown(skillsShown);
-  canvas.setSkillsShown(skillsShown);
+function setSkillsShown(shown: boolean): void {
+  skillsShown = shown;
+  storeSkillsShown(shown);
+  canvas.setSkillsShown(shown);
   if (state.session !== null && !visibleNodes().has(state.session)) state.session = chooseSession();
-  if (!skillsShown && state.agent !== null && state.nodes.get(state.agent)?.flavor.kind === "skill") selectAgent(null);
+  if (!shown && state.agent !== null && state.nodes.get(state.agent)?.flavor.kind === "skill") selectAgent(null);
   else render();
-} });
+}
+
+const explorer = new Explorer({ change: () => render(), select: (id) => selectAgent(id), skills: setSkillsShown });
+const canvas = new Canvas({ select: (id) => selectAgent(id), toggleSkills: () => setSkillsShown(!skillsShown) });
+explorer.graphHost.append(canvas.element);
 canvas.setSkillsShown(skillsShown);
 const panel = new Panel({
   close: () => selectAgent(null),
   select: (id) => selectAgent(id),
   loadOlder: (agent, before) => fetchTimeline(agent, before),
-  resized: (width, settled) => canvas.setRightInset(insetFor(width), settled),
+  resized: (width, settled) => setRightInset(insetFor(width), settled),
 });
 const rail = new Rail({ select: (root) => selectSession(root) });
+const setupView = new SetupView({ refresh: () => void fetchSetup() });
 
 const sessionTitle = h("h1", { class: "bar-title" });
 const sessionPath = h("span", { class: "bar-path mono" });
@@ -88,10 +103,12 @@ const live = h("div", { class: "live", attrs: { role: "status" } }, h("span", { 
 const railToggle = h("button", { class: "icon-button rail-toggle", title: "Sessions", attrs: { type: "button", "aria-label": "Show sessions" } }, icon("sessions"));
 railToggle.addEventListener("click", () => toggleRail());
 const banner = h("div", { class: "banner", attrs: { hidden: "", role: "note" } });
+const viewButton = h("button", { class: "quiet-action", attrs: { type: "button" } });
+viewButton.addEventListener("click", () => setView(state.view === "setup" ? "sessions" : "setup"));
 const journalButton = h("button", { class: "quiet-action", attrs: { type: "button" } });
 const stopButton = h("button", { class: "quiet-action", attrs: { type: "button" } }, icon("stop"), h("span", { text: "Stop monitor" }));
 const controlMessage = h("span", { class: "bar-command-message", attrs: { role: "status", hidden: "" } });
-const barControls = h("div", { class: "bar-controls" }, journalButton, stopButton, controlMessage);
+const barControls = h("div", { class: "bar-controls" }, viewButton, journalButton, stopButton, controlMessage);
 
 const bar = h(
   "header",
@@ -110,6 +127,8 @@ let journalPending = false;
 let stopPending = false;
 
 function renderControls(): void {
+  viewButton.replaceChildren(icon(state.view === "setup" ? "sessions" : "sliders"), h("span", { text: state.view === "setup" ? "Sessions" : "Setup" }));
+  viewButton.title = state.view === "setup" ? "Back to session agents" : "pstack skills, providers, model roles, and settings";
   const journal = state.server?.journal === true;
   const journalArmed = journal && journalConfirmUntil > Date.now();
   journalButton.replaceChildren(icon("lane"), h("span", { text: state.server === null ? "Journal…" : journalPending ? "Updating…" : journalArmed ? "Confirm: Delete recorded lanes?" : `Journal: ${journal ? "on" : "off"}` }));
@@ -183,10 +202,12 @@ stopButton.addEventListener("click", () => {
   })();
 });
 
-const stage = h("main", { class: "stage" }, canvas.element, banner, panel.element);
+const stage = h("main", { class: "stage" }, explorer.element, banner, panel.element);
 const scrim = h("div", { class: "scrim", attrs: { "aria-hidden": "true" } });
 scrim.addEventListener("click", () => toggleRail(false));
-document.body.append(bar, rail.element, stage, scrim);
+document.body.append(bar, rail.element, stage, setupView.element, scrim);
+document.body.dataset.view = state.view;
+setupView.element.hidden = state.view !== "setup";
 document.documentElement.dataset.harness = defaultHarness;
 
 // --- data ------------------------------------------------------------------
@@ -244,6 +265,29 @@ async function fetchTimeline(agent: AgentId, before: number): Promise<TimelinePa
   } catch {
     return null;
   }
+}
+
+async function fetchSetup(): Promise<void> {
+  try {
+    const response = await fetch("/api/setup");
+    if (!response.ok) throw new Error(response.status === 401 ? "This link expired. Run `psf-monitor start` and open the new link." : "The monitor could not read the pstack setup.");
+    state.setup = (await response.json()) as PstackSetup;
+    state.setupError = null;
+  } catch (error) {
+    state.setupError = error instanceof TypeError ? "Could not reach the monitor." : error instanceof Error ? error.message : "Could not read the pstack setup.";
+  }
+  render();
+}
+
+function setView(view: View): void {
+  if (state.view === view) return;
+  state.view = view;
+  document.body.dataset.view = view;
+  setupView.element.hidden = view !== "setup";
+  history.replaceState(null, "", view === "setup" ? SETUP_HASH : `${location.pathname}${location.search}`);
+  toggleRail(false);
+  if (view === "setup") void fetchSetup();
+  render();
 }
 
 function onSnapshot(snapshot: Snapshot): void {
@@ -307,7 +351,7 @@ function selectSession(root: AgentId): void {
   if (state.agent !== null) {
     state.agent = null;
     panel.close();
-    canvas.setRightInset(0);
+    setRightInset(0);
   }
   render();
 }
@@ -319,7 +363,7 @@ function selectAgent(id: AgentId | null): void {
   state.agent = id;
   if (id === null) {
     panel.close();
-    canvas.setRightInset(0);
+    setRightInset(0);
     render();
     connect();
     return;
@@ -330,8 +374,8 @@ function selectAgent(id: AgentId | null): void {
   if (root !== state.session) state.session = root;
   panel.open(node, shown, Date.now());
   render();
-  canvas.setRightInset(insetFor(panel.width));
-  canvas.reveal(id);
+  setRightInset(insetFor(panel.width));
+  if (explorer.isGraph) canvas.reveal(id);
   // The stream carries the watched agent's timeline, so a new selection reconnects.
   connect();
 }
@@ -341,9 +385,14 @@ function insetFor(width: number): number {
   return stage.clientWidth - width >= CANVAS_MIN ? width : 0;
 }
 
+function setRightInset(pixels: number, reveal = true): void {
+  explorer.element.style.setProperty("--detail-inset", `${pixels}px`);
+  canvas.setRightInset(pixels, reveal);
+}
+
 function fitPanel(): void {
-  panel.setMaxWidth(Math.max(PANEL_MIN, stage.clientWidth - PANEL_GUTTER));
-  canvas.setRightInset(state.agent === null ? 0 : insetFor(panel.width), false);
+  panel.setMaxWidth(Math.max(PANEL_MIN, stage.clientWidth));
+  setRightInset(state.agent === null ? 0 : insetFor(panel.width), false);
 }
 
 function toggleRail(open?: boolean): void {
@@ -367,34 +416,26 @@ function render(): void {
     descendants.set(root, { total: entry.total + (node.flavor.kind === "skill" ? 0 : 1), skills: entry.skills + (node.flavor.kind === "skill" ? 1 : 0), running: entry.running + (node.flavor.kind !== "skill" && working(node, now) ? 1 : 0) });
   }
   const hours = state.server?.windowHours ?? 24;
-  rail.render(roots, descendants, state.session, now, `Last ${hours} hours`);
+  rail.render(roots, descendants, state.session, now, `All projects · Last ${hours} hours`);
 
   const tree = state.session === null ? null : treeOf(state.session, shown);
   const fullTree = state.session === null ? null : treeOf(state.session, all);
-  canvas.render(tree, state.agent, now, state.links);
+  const message = state.connection === "stopped" ? "Monitor stopped. Run psf-monitor start to start it again."
+    : state.connection === "expired" ? "Link expired. Run psf-monitor start and open the new link."
+    : all.size === 0 ? state.server?.indexing === true ? "Reading recent transcripts…" : `No pstack sessions in the last ${hours} hours. Run a pstack skill in Claude Code or Codex to begin.`
+    : null;
+  const filtered = explorer.render(tree, state.agent, now, skillsShown, message);
+  if (explorer.isGraph) canvas.render(filtered, state.agent, now, state.links);
   document.documentElement.dataset.harness = tree?.root.harness ?? defaultHarness;
 
-  if (state.connection === "stopped") {
-    canvas.setEmpty(h("div", { class: "empty" }, logo(), h("h2", { text: "Monitor stopped" }), h("p", {}, "Run ", h("code", { text: "psf-monitor start" }), " to start it again.")));
-  } else if (state.connection === "expired") {
-    canvas.setEmpty(
-      h(
-        "div",
-        { class: "empty" },
-        logo(),
-        h("h2", { text: "Link expired" }),
-        h("p", {}, "Run ", h("code", { text: "psf-monitor start" }), " and open the new link."),
-      ),
-    );
-  } else if (all.size === 0) {
-    canvas.setEmpty(emptyState(state.server?.indexing === true));
-  } else if (tree !== null && tree.nodes.length === 1) {
-    canvas.setEmpty(h("p", { class: "canvas-hint", text: "No agents spawned yet." }));
-  } else {
-    canvas.setEmpty(null);
-  }
+  canvas.setEmpty(null);
 
-  if (tree === null) {
+  if (state.view === "setup") {
+    setupView.render({ setup: state.setup, error: state.setupError, nodes: all, server: state.server, now });
+    sessionTitle.textContent = "pstack setup";
+    sessionPath.textContent = "";
+    stats.replaceChildren();
+  } else if (tree === null) {
     sessionTitle.textContent = "No session selected";
     sessionPath.textContent = "";
     stats.replaceChildren();
@@ -428,18 +469,6 @@ function render(): void {
 
 function stat(kind: string, value: number, label: string, shown = String(value)): HTMLElement {
   return h("span", { class: "stat", attrs: { "data-kind": kind, "data-zero": String(value === 0) } }, h("b", { text: shown }), h("span", { text: ` ${label}` }));
-}
-
-function emptyState(indexing: boolean): HTMLElement {
-  const hours = state.server?.windowHours ?? 24;
-  if (indexing) return h("div", { class: "empty" }, logo(), h("h2", { text: "Reading recent transcripts…" }));
-  return h(
-    "div",
-    { class: "empty" },
-    logo(),
-    h("h2", { text: `No pstack sessions in the last ${hours} hours` }),
-    h("p", { text: "Run a pstack skill in Claude Code or Codex and it appears here." }),
-  );
 }
 
 function renderBanner(): void {
@@ -503,7 +532,10 @@ window.setInterval(() => render(), 30_000);
 
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
-  if (document.body.dataset.rail === "open") toggleRail(false);
+  if (state.view === "setup") {
+    // Escape first clears a search field; leave that to the field.
+    if (!(event.target instanceof HTMLInputElement)) setView("sessions");
+  } else if (document.body.dataset.rail === "open") toggleRail(false);
   else if (state.agent !== null) selectAgent(null);
 });
 
@@ -511,3 +543,4 @@ new ResizeObserver(() => fitPanel()).observe(stage);
 
 renderControls();
 connect();
+if (state.view === "setup") void fetchSetup();

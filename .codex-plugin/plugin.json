@@ -18,5 +18,6 @@
     "capabilities": ["Interactive", "Read"],
     "defaultPrompt": ["Open the monitor."],
     "websiteURL": "https://github.com/thisguymartin/psf-monitor"
-  }
+  },
+  "hooks": "./hooks/codex.json"
 }
