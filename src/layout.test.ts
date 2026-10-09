@@ -18,6 +18,7 @@ function node(id: string, parent: string | null, status: AgentStatus["kind"] = "
     parent: parent as AgentId | null,
     via: null,
     spawnCall: null,
+    pstack: true,
     harness: "claude",
     source: "claude-session",
     flavor: parent === null ? { kind: "session" } : { kind: "subagent", agentType: null },

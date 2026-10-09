@@ -3,16 +3,19 @@ import { open } from "node:fs/promises";
 import { MessageInbox, messageTarget } from "./messages.ts";
 import { AGENT_ACTIONS } from "./actions.ts";
 import type { CancelResult } from "./control.ts";
-import type { AgentId } from "./domain.ts";
-import { journalEnabled, journalOff, journalOn } from "./journal.ts";
+import { SCOPES, type AgentId, type Scope } from "./domain.ts";
+import { clearLanes, deleteLane, isLaneId, journalEnabled, journalOff, journalOn, listLanes } from "./journal.ts";
 import { FIRST_PAGE, type Monitor } from "./monitor.ts";
-import type { PstackSetup, ServerEvent } from "./wire.ts";
+import type { JournalState, PstackSetup, ServerEvent, SheetRole, SheetWriteRequest, SheetWriteResponse } from "./wire.ts";
 
 // The monitor's HTTP surface. Loopback only, with a per-start token.
 
 const MAX_PAGE = 400;
 const MAX_ID = 300;
-const MAX_BODY = 4 * 1024;
+/** Room for a whole model sheet: a few dozen roles with a handful of lanes each. */
+const MAX_BODY = 32 * 1024;
+const MAX_ROLES = 64;
+const MAX_LANES = 16;
 const MAX_RESULT = 256 * 1024;
 
 export interface Assets {
@@ -29,6 +32,8 @@ export interface HandlerOptions {
   readonly cancel: (id: AgentId) => Promise<CancelResult>;
   /** Reads how pstack is set up; absent where no one asks. */
   readonly setup?: () => PstackSetup;
+  /** Writes or deletes a model sheet; absent where the page may only read. */
+  readonly sheet?: (request: SheetWriteRequest) => SheetWriteResponse;
   readonly inbox?: MessageInbox;
   readonly stop: () => void;
 }
@@ -78,6 +83,12 @@ function agentParam(value: string | null): AgentId | null {
   return value as AgentId;
 }
 
+/** The page's scope; absent means pstack sessions only, and anything unknown is refused. */
+function scopeParam(value: string | null): Scope | null {
+  if (value === null) return "pstack";
+  return (SCOPES as readonly string[]).includes(value) ? (value as Scope) : null;
+}
+
 function cursorParam(value: string | null): number | null {
   if (value === null) return null;
   const parsed = Number(value);
@@ -98,6 +109,25 @@ async function readJson(request: Request): Promise<unknown> {
 
 function object(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** The sheet request shape, with every string bounded; the sheet module decides what the values mean. */
+function sheetRequest(body: unknown): SheetWriteRequest | null {
+  if (!object(body)) return null;
+  if ((body.harness !== "claude" && body.harness !== "codex") || (body.scope !== "global" && body.scope !== "project")) return null;
+  if (body.root !== null && (typeof body.root !== "string" || body.root.length === 0 || body.root.length > 1024)) return null;
+  let roles: SheetRole[] | null = null;
+  if (body.roles !== null) {
+    if (!Array.isArray(body.roles) || body.roles.length > MAX_ROLES) return null;
+    roles = [];
+    for (const entry of body.roles as unknown[]) {
+      if (!object(entry) || typeof entry.role !== "string" || entry.role.length > 80 || !Array.isArray(entry.lanes) || entry.lanes.length > MAX_LANES) return null;
+      const lanes = entry.lanes as unknown[];
+      if (!lanes.every((lane): lane is string => typeof lane === "string" && lane.length > 0 && lane.length <= 200)) return null;
+      roles.push({ role: entry.role.trim(), lanes: lanes.map((lane) => lane.trim()) });
+    }
+  }
+  return { harness: body.harness, scope: body.scope, root: body.root as string | null, roles, confirmDiversity: body.confirmDiversity === true };
 }
 
 export function createHandler(monitor: Monitor, options: HandlerOptions) {
@@ -141,7 +171,7 @@ export function createHandler(monitor: Monitor, options: HandlerOptions) {
 
     if (request.method === "POST") {
       if (!origins.has(origin ?? "")) return plain(403, "origin required");
-      if (url.pathname !== "/api/messages" && url.pathname !== "/api/action" && url.pathname !== "/api/journal" && url.pathname !== "/api/stop") return plain(405, "method not allowed");
+      if (url.pathname !== "/api/messages" && url.pathname !== "/api/action" && url.pathname !== "/api/journal" && url.pathname !== "/api/reset" && url.pathname !== "/api/sheet" && url.pathname !== "/api/stop") return plain(405, "method not allowed");
       let body: unknown;
       try {
         body = await readJson(request);
@@ -176,18 +206,51 @@ export function createHandler(monitor: Monitor, options: HandlerOptions) {
               case "not-cancellable": return json({ ok: false, message: result.reason }, 409);
             }
           }
+          case "hide":
+            return monitor.hide(body.agent as AgentId) === null
+              ? json({ ok: false, message: "Unknown agent." }, 404)
+              : json({ ok: true, message: "Session hidden. It returns when it is active again." });
           case "copy-resume":
             return json({ ok: false, message: "Unknown server action." }, 400);
         }
       }
       if (url.pathname === "/api/journal") {
-        if (!object(body) || typeof body.on !== "boolean") return json({ ok: false, message: "Expected on: boolean." }, 400);
+        if (!object(body)) return json({ ok: false, message: "Expected JSON object." }, 400);
         try {
-          const change = body.on ? journalOn(options.lanes) : journalOff(options.lanes);
-          return json({ ok: true, journal: journalEnabled(options.lanes), message: change === "enabled" ? "Lane journal on." : change === "disabled" ? "Lane journal off; recorded lanes deleted." : body.on ? "Lane journal is already on." : "Lane journal is already off." });
+          if (typeof body.on === "boolean") {
+            const change = body.on ? journalOn(options.lanes) : journalOff(options.lanes);
+            return json({ ok: true, journal: journalEnabled(options.lanes), message: change === "enabled" ? "Lane journal on." : change === "disabled" ? "Lane journal off; recorded lanes deleted." : body.on ? "Lane journal is already on." : "Lane journal is already off." });
+          }
+          if (typeof body.delete === "string") {
+            if (!isLaneId(body.delete)) return json({ ok: false, message: "Not a lane id." }, 400);
+            if (monitor.laneRunning(body.delete)) return json({ ok: false, message: "This lane is still running. Cancel it first." }, 409);
+            const result = deleteLane(options.lanes, body.delete);
+            if (result === "missing") return json({ ok: false, message: "Lane records are already gone." }, 404);
+            monitor.forgetLane(body.delete);
+            return json({ ok: true, journal: journalEnabled(options.lanes), message: "Lane records deleted." });
+          }
+          if (body.clear === true) {
+            const { deleted, kept } = clearLanes(options.lanes, (lane) => monitor.laneRunning(lane));
+            for (const lane of deleted) monitor.forgetLane(lane);
+            const summary = `${deleted.length} lane${deleted.length === 1 ? "" : "s"} deleted${kept.length > 0 ? `; ${kept.length} running lane${kept.length === 1 ? "" : "s"} kept` : ""}.`;
+            return json({ ok: true, journal: journalEnabled(options.lanes), message: summary });
+          }
+          return json({ ok: false, message: "Expected on, delete, or clear." }, 400);
         } catch {
           return json({ ok: false, message: "Could not change lane journal." }, 500);
         }
+      }
+      if (url.pathname === "/api/reset") {
+        if (!object(body)) return json({ ok: false, message: "Expected JSON object." }, 400);
+        const hidden = monitor.resetHidden();
+        return json({ ok: true, hidden, message: hidden === 0 ? "No hidden sessions." : `${hidden} hidden session${hidden === 1 ? "" : "s"} shown again.` });
+      }
+      if (url.pathname === "/api/sheet") {
+        if (options.sheet === undefined) return json({ ok: false, message: "This monitor does not write model sheets." }, 404);
+        const request = sheetRequest(body);
+        if (request === null) return json({ ok: false, message: "Expected harness, scope, root, roles, and confirmDiversity." }, 400);
+        const result = options.sheet(request);
+        return json(result, result.ok ? 200 : result.errors.length > 0 ? 422 : 409);
       }
       if (!object(body)) return json({ ok: false, message: "Expected JSON object." }, 400);
       const response = json({ ok: true });
@@ -207,8 +270,14 @@ export function createHandler(monitor: Monitor, options: HandlerOptions) {
         return respond(200, options.assets.js, { "Content-Type": "text/javascript; charset=utf-8" });
       case "/app.css":
         return respond(200, options.assets.css, { "Content-Type": "text/css; charset=utf-8" });
-      case "/api/snapshot":
-        return json(monitor.snapshot());
+      case "/api/snapshot": {
+        const scope = scopeParam(url.searchParams.get("scope"));
+        return scope === null ? plain(400, "scope must be pstack, normal, or all") : json(monitor.snapshot(scope));
+      }
+      case "/api/journal": {
+        const state: JournalState = { on: journalEnabled(options.lanes), root: options.lanes, lanes: listLanes(options.lanes, (lane) => monitor.laneRunning(lane)) };
+        return json(state);
+      }
       case "/api/messages": {
         const agent = agentParam(url.searchParams.get("agent"));
         const target = agent === null ? null : messageTarget(monitor.store, agent);
@@ -244,10 +313,14 @@ export function createHandler(monitor: Monitor, options: HandlerOptions) {
         const page = monitor.timeline(agent, cursorParam(url.searchParams.get("before")), Math.max(1, limit));
         return page === null ? plain(404, "unknown agent") : json(page);
       }
-      case "/api/events":
-        return events(monitor, agentParam(url.searchParams.get("watch")), request, server);
+      case "/api/events": {
+        const scope = scopeParam(url.searchParams.get("scope"));
+        if (scope === null) return plain(400, "scope must be pstack, normal, or all");
+        return events(monitor, scope, agentParam(url.searchParams.get("watch")), request, server);
+      }
       case "/api/action":
-      case "/api/journal":
+      case "/api/reset":
+      case "/api/sheet":
       case "/api/stop":
         return plain(405, "method not allowed");
       default:
@@ -256,7 +329,7 @@ export function createHandler(monitor: Monitor, options: HandlerOptions) {
   };
 }
 
-function events(monitor: Monitor, watchAgent: AgentId | null, request: Request, server?: ServerControl): Response {
+function events(monitor: Monitor, scope: Scope, watchAgent: AgentId | null, request: Request, server?: ServerControl): Response {
   const encoder = new TextEncoder();
   let unsubscribe: (() => void) | null = null;
   const close = (): void => {
@@ -266,6 +339,7 @@ function events(monitor: Monitor, watchAgent: AgentId | null, request: Request, 
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       unsubscribe = monitor.subscribe({
+        scope,
         watch: watchAgent,
         send: (event: ServerEvent) => {
           controller.enqueue(encoder.encode(`event: ${event.event}\ndata: ${JSON.stringify(event.data)}\n\n`));

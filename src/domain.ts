@@ -12,6 +12,9 @@ export type AgentId = Brand<string, "AgentId">;
 export type ItemId = Brand<string, "ItemId">;
 
 export type Harness = "claude" | "codex" | "opencode";
+/** Which session trees a page asks for: those with pstack evidence, those without, or every tree. */
+export type Scope = "pstack" | "normal" | "all";
+export const SCOPES: readonly Scope[] = ["pstack", "normal", "all"];
 export type SourceKind = "claude-session" | "codex-rollout" | "opencode-session" | "runner-lane";
 export type Health = "ok" | "degraded";
 
@@ -76,6 +79,8 @@ export interface AgentNode {
   readonly harness: Harness;
   readonly source: SourceKind;
   readonly flavor: Flavor;
+  /** True when any agent in this agent's spawn tree carries pstack evidence. */
+  readonly pstack: boolean;
   readonly title: string;
   readonly cwd: string | null;
   readonly model: ModelInfo;

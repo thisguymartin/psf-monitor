@@ -3,7 +3,7 @@ import { buildAssets } from "./assets.ts";
 import { DEFAULT_PORT, diskSetup, serve, start, status, stop, type Io } from "./daemon.ts";
 import { diagnose, renderReport } from "./doctor.ts";
 import type { Harness } from "./domain.ts";
-import { journalEnabled, journalOff, journalOn } from "./journal.ts";
+import { clearLanes, deleteLane, journalEnabled, journalOff, journalOn, listLanes } from "./journal.ts";
 import { renderSetup } from "./setup.ts";
 import { homes, type Homes } from "./sources.ts";
 
@@ -17,8 +17,10 @@ Commands:
   stop      Stop the monitor. Agents keep running.
   doctor    Report how well recent transcripts parsed (counts only).
   setup     List pstack's skills, providers, model roles, and settings.
-  journal <on|off|status>
-            Record external lanes for the monitor. \`off\` deletes the records.
+  journal <on|off|status|list|clear|rm <lane id>>
+            Record external lanes for the monitor. \`off\` deletes the records
+            and turns recording off; \`clear\` deletes them and keeps recording;
+            \`rm\` deletes one lane; \`list\` shows what is recorded.
   serve     Run the server in the foreground.
 
 Options:
@@ -42,12 +44,14 @@ class UsageError extends Error {}
 
 const COMMANDS = ["start", "status", "stop", "doctor", "setup", "journal", "serve"] as const;
 type Command = (typeof COMMANDS)[number];
-const JOURNAL_ACTIONS = ["on", "off", "status"] as const;
+const JOURNAL_ACTIONS = ["on", "off", "status", "list", "clear", "rm"] as const;
 type JournalAction = (typeof JOURNAL_ACTIONS)[number];
 
 export interface Options {
   readonly command: Command | "help";
   readonly journal: JournalAction;
+  /** The lane `journal rm` removes. */
+  readonly lane: string | null;
   readonly port: number;
   readonly hours: number;
   readonly harness: Harness | null;
@@ -98,18 +102,44 @@ export function parseArgs(argv: readonly string[], env: NodeJS.ProcessEnv = proc
   const session = focusValue ?? currentSession(harness, env);
   const focus = session === null || harness === null || session.includes(":") ? session : `${harness}:${session}`;
   if (parsed.values.help === true || command === undefined || command === "help") {
-    return { command: "help", journal: "status", port, hours, harness, focus };
+    return { command: "help", journal: "status", lane: null, port, hours, harness, focus };
   }
   if (!(COMMANDS as readonly string[]).includes(command)) throw new UsageError(`unknown command: ${command}`);
   const action = parsed.positionals[1] ?? "status";
   if (command === "journal" && !(JOURNAL_ACTIONS as readonly string[]).includes(action)) {
-    throw new UsageError("journal takes on, off, or status");
+    throw new UsageError("journal takes on, off, status, list, clear, or rm <lane id>");
   }
-  return { command: command as Command, journal: action as JournalAction, port, hours, harness, focus };
+  const lane = parsed.positionals[2] ?? null;
+  if (command === "journal" && action === "rm" && lane === null) throw new UsageError("journal rm needs a lane id; see `journal list`");
+  return { command: command as Command, journal: action as JournalAction, lane, port, hours, harness, focus };
 }
 
-function journal(where: Homes, action: JournalAction, io: Io): number {
+function laneLine(lane: ReturnType<typeof listLanes>[number]): string {
+  const model = [lane.provider, lane.model].filter((part) => part !== null).join(":") + (lane.effort === null ? "" : `@${lane.effort}`);
+  const size = lane.bytes >= 1_048_576 ? `${(lane.bytes / 1_048_576).toFixed(1)} MB` : lane.bytes >= 1024 ? `${Math.round(lane.bytes / 1024)} KB` : `${lane.bytes} B`;
+  return `${lane.laneId}  ${lane.status.padEnd(16)}  ${(lane.startedAt ?? "?").padEnd(24)}  ${size.padStart(8)}  ${model}${lane.label === null ? "" : `  "${lane.label}"`}`;
+}
+
+function journal(where: Homes, action: JournalAction, lane: string | null, io: Io): number {
   switch (action) {
+    case "list": {
+      const lanes = listLanes(where.lanes);
+      if (!journalEnabled(where.lanes)) io.stdout("lane journal off\n");
+      else if (lanes.length === 0) io.stdout(`no recorded lanes in ${where.lanes}\n`);
+      else io.stdout(`${lanes.map(laneLine).join("\n")}\n`);
+      return 0;
+    }
+    case "clear": {
+      const { deleted } = clearLanes(where.lanes);
+      io.stdout(`deleted ${deleted.length} recorded lane${deleted.length === 1 ? "" : "s"}; lane journal ${journalEnabled(where.lanes) ? "stays on" : "is off"}\n`);
+      return 0;
+    }
+    case "rm": {
+      const result = deleteLane(where.lanes, lane ?? "");
+      if (result === "deleted") { io.stdout(`deleted lane ${lane}\n`); return 0; }
+      io.stderr(result === "invalid" ? `error: ${lane} is not a lane id; see \`journal list\`\n` : `error: no recorded lane ${lane}\n`);
+      return 1;
+    }
     case "on":
       io.stdout(journalOn(where.lanes) === "enabled"
         ? `lane journal on: external lanes are recorded in ${where.lanes} and kept 7 days\n`
@@ -149,11 +179,11 @@ export async function main(
     case "stop":
       return stop(where, io);
     case "journal":
-      return journal(where, options.journal, io);
+      return journal(where, options.journal, options.lane, io);
     case "serve":
       return serve(where, { port: options.port, windowHours: options.hours, assets: buildAssets }, io);
     case "setup":
-      io.stdout(renderSetup(diskSetup(where)));
+      io.stdout(renderSetup(diskSetup(where, [process.cwd()])));
       return 0;
     case "doctor": {
       const report = await diagnose(where, Date.now() - options.hours * 3_600_000);

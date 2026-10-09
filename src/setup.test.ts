@@ -146,6 +146,19 @@ describe("readSetup", () => {
     expect(codex).toMatchObject({ harness: "codex", present: true, roles: [{ role: "bug-fix", lanes: ["deepseek:deepseek-v4-pro@high"] }] });
   });
 
+  it("lists the git projects the sessions ran in, with their sheets", () => {
+    const repo = join(scratch, "projects", "app");
+    mkdirSync(join(repo, ".git"), { recursive: true });
+    write(join(repo, ".claude", "pstack-models.md"), "# pstack model configuration\n\nbug-fix: codex:gpt-6-sol@low\n");
+    const setup = readSetup({ ...options(), cwds: [join(repo, "src"), repo, join(scratch, "loose")] });
+    expect(setup.projects).toHaveLength(1);
+    expect(setup.projects[0]).toMatchObject({ root: repo, name: "app", sessions: 2 });
+    expect(setup.projects[0]!.sheets.map((sheet) => [sheet.harness, sheet.scope, sheet.present, sheet.writable])).toEqual([["claude", "project", true, true], ["codex", "project", false, true]]);
+    expect(setup.projects[0]!.sheets[0]!.roles).toEqual([{ role: "bug-fix", lanes: ["codex:gpt-6-sol@low"] }]);
+    expect(setup.sheets[0]).toMatchObject({ scope: "global", writable: false });
+    expect(renderSetup(setup)).toContain("Model roles · app · Claude Code");
+  });
+
   it("reports nothing installed without failing", () => {
     const empty = join(scratch, "empty");
     const setup = readSetup({ ...options(), where: { claude: empty, codex: empty, lanes: empty, state: empty } });

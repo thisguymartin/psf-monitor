@@ -1,4 +1,4 @@
-import type { AgentId, AgentNode, Harness, Health, MessageLink, SourceKind, TimelineItem } from "./domain.ts";
+import type { AgentId, AgentNode, Harness, Health, MessageLink, ReceiptStatus, SourceKind, TimelineItem } from "./domain.ts";
 import type { AgentActionId } from "./actions.ts";
 
 // The JSON shapes the server sends the browser.
@@ -42,6 +42,8 @@ export interface Snapshot {
 export interface Delta {
   readonly rev: number;
   readonly upserts: readonly AgentNode[];
+  /** Agents the page should drop: hidden sessions and deleted lanes. */
+  readonly removals: readonly AgentId[];
   /** The whole link list when it changed; null when it did not. */
   readonly links: readonly MessageLink[] | null;
   readonly health: readonly SourceHealth[] | null;
@@ -59,9 +61,30 @@ export interface ActionResponse {
   readonly message: string;
 }
 
-export interface JournalRequest { readonly on: boolean }
+export type JournalRequest = { readonly on: boolean } | { readonly delete: string } | { readonly clear: true };
 export interface JournalResponse extends ActionResponse { readonly journal: boolean }
+export interface ResetResponse extends ActionResponse { readonly hidden: number }
 export interface StopResponse { readonly ok: true }
+
+/** One recorded lane in pstack's journal, as the page lists it. */
+export interface LaneSummary {
+  readonly laneId: string;
+  readonly label: string | null;
+  readonly provider: string | null;
+  readonly model: string | null;
+  readonly effort: string | null;
+  readonly parent: string | null;
+  readonly startedAt: string | null;
+  /** The receipt's status; "running" while a live runner owns the lane; "unknown" when nothing says. */
+  readonly status: ReceiptStatus | "running" | "unknown";
+  readonly bytes: number;
+}
+
+export interface JournalState {
+  readonly on: boolean;
+  readonly root: string;
+  readonly lanes: readonly LaneSummary[];
+}
 
 export interface TimelinePage {
   readonly agent: AgentId;
@@ -138,11 +161,44 @@ export interface SheetRole {
   readonly lanes: readonly string[];
 }
 
+export type SheetScope = "global" | "project";
+
 export interface ModelSheet {
   readonly harness: Harness;
+  readonly scope: SheetScope;
   readonly path: string;
   readonly present: boolean;
   readonly roles: readonly SheetRole[];
+  /** True when the monitor may write this file: any project sheet, or a global sheet that already exists. */
+  readonly writable: boolean;
+  /** True when the monitor wrote it without pstack's live model probe. */
+  readonly unprobed: boolean;
+}
+
+/** A git project the monitor saw sessions in, with its per-harness sheets. A project sheet replaces the global one whole. */
+export interface ProjectSetup {
+  readonly root: string;
+  readonly name: string;
+  /** Sessions in the indexed window whose working directory is inside this project. */
+  readonly sessions: number;
+  readonly sheets: readonly ModelSheet[];
+}
+
+export interface SheetWriteRequest {
+  readonly harness: Harness;
+  readonly scope: SheetScope;
+  /** The project root from `PstackSetup.projects`; null for the global sheet. */
+  readonly root: string | null;
+  /** The whole sheet to write, or null to delete a project sheet. */
+  readonly roles: readonly SheetRole[] | null;
+  /** The operator accepted a single-provider panel. */
+  readonly confirmDiversity: boolean;
+}
+
+export interface SheetWriteResponse extends ActionResponse {
+  readonly path: string | null;
+  readonly errors: readonly string[];
+  readonly warnings: readonly string[];
 }
 
 export interface SetupSetting {
@@ -157,6 +213,7 @@ export interface PstackSetup {
   readonly skills: readonly SkillInfo[];
   readonly providers: readonly ProviderSetup[];
   readonly sheets: readonly ModelSheet[];
+  readonly projects: readonly ProjectSetup[];
   /** The roles pstack uses until a sheet is written. */
   readonly defaults: readonly SheetRole[];
   readonly settings: readonly SetupSetting[];

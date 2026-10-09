@@ -89,7 +89,7 @@ export class Panel {
 
   constructor(private readonly events: PanelEvents) {
     this.glyph = h("span", { class: "panel-glyph" });
-    this.title = h("h2", { class: "panel-title", attrs: { id: "panel-title" } });
+    this.title = h("h2", { class: "panel-title", attrs: { id: "panel-title", tabindex: "-1" } });
     this.kind = h("p", { class: "panel-kind" });
     this.chip = h("p", { class: "status-chip" });
     this.facts = h("dl", { class: "facts" });
@@ -230,6 +230,10 @@ export class Panel {
     this.element.dataset.open = "true";
     this.applyWidth();
     this.renderHeader(now);
+  }
+
+  focus(): void {
+    this.title.focus({ preventScroll: true });
   }
 
   close(): void {
@@ -411,6 +415,7 @@ export class Panel {
         }
         this.confirmations.delete(action.id);
         if (action.id === "copy-resume") void this.copyResume(node);
+        else if (action.id === "hide") void this.hideSession(node);
         else void this.cancelLane(node);
       });
       return button;
@@ -437,6 +442,21 @@ export class Panel {
       window.setTimeout(() => this.renderActions(), 2_050);
     } catch {
       if (this.agent?.id === node.id) this.showActionMessage("Could not copy the resume command.");
+    }
+  }
+
+  /** The server drops the tree from the stream; the page closes the panel once the request is accepted. */
+  private async hideSession(node: AgentNode): Promise<void> {
+    this.showActionMessage("");
+    try {
+      const { status, data } = await postJson<ActionResponse>("/api/action", { agent: node.id, action: "hide" });
+      if (status === 200 && data.ok) {
+        if (this.agent?.id === node.id) this.events.close();
+        return;
+      }
+      if (this.agent?.id === node.id) this.showActionMessage(data.message);
+    } catch {
+      if (this.agent?.id === node.id) this.showActionMessage("Could not reach the monitor.");
     }
   }
 

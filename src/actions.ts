@@ -1,6 +1,6 @@
 import type { AgentNode } from "./domain.ts";
 
-export type AgentActionId = "cancel" | "copy-resume";
+export type AgentActionId = "cancel" | "copy-resume" | "hide";
 
 export interface AgentAction {
   readonly id: AgentActionId;
@@ -24,6 +24,14 @@ export const AGENT_ACTIONS: readonly AgentAction[] = [
     runs: "client",
     confirm: null,
     available: (node) => node.flavor.kind === "session" && (node.harness === "claude" || node.harness === "codex" || node.harness === "opencode"),
+  },
+  {
+    id: "hide",
+    label: "Hide session",
+    runs: "server",
+    confirm: "Hide this session until it is active again?",
+    // Any tree root: a session, or a lane that attached to no session.
+    available: (node) => node.parent === null,
   },
 ];
 

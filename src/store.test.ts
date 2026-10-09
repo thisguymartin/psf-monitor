@@ -248,11 +248,17 @@ describe("pstack visibility", () => {
       otherSession,
     );
     expect(result.nodes()).toEqual([]);
-    expect(result.flush()).toBeNull();
+    expect(result.nodes("normal").map((node) => node.id).sort()).toEqual([root, child, other].sort());
+    // Every scope's page is fed from one flush; the flag tells each page what it is.
+    expect(result.flush()!.upserts.every((node) => !node.pstack)).toBe(true);
     result.apply({ kind: "pstack", id: child });
     expect(result.nodes().map((node) => node.id).sort()).toEqual([root, child].sort());
     expect(result.flush()!.upserts.map((node) => node.id).sort()).toEqual([root, child].sort());
     expect(result.nodes().some((node) => node.id === other)).toBe(false);
+    expect(result.nodes("normal").map((node) => node.id)).toEqual([other]);
+    expect(result.nodes("all").length).toBe(3);
+    expect(result.node(root)!.pstack).toBe(true);
+    expect(result.node(other)!.pstack).toBe(false);
   });
 
   it("sends the newly marked tree in the next flush", () => {
@@ -272,10 +278,72 @@ describe("pstack visibility", () => {
       { kind: "link", id: lane, parent: root, via: "runner" },
     );
     expect(result.nodes()).toEqual([]);
-    expect(result.flush()).toBeNull();
+    expect(result.flush()!.upserts.every((node) => !node.pstack)).toBe(true);
     result.apply({ kind: "pstack", id: lane });
     expect(result.nodes().map((node) => node.id).sort()).toEqual([root, child, lane].sort());
     expect(result.flush()!.upserts.map((node) => node.id).sort()).toEqual([root, child, lane].sort());
+  });
+});
+
+describe("hidden sessions", () => {
+  const other = "claude:s2" as AgentId;
+  const otherSession: Fact = { ...session, id: other } as Fact;
+  const activity = (id: AgentId, at: string): Fact => ({ kind: "activity", id, activity: { what: "text", snippet: "hi", at } });
+
+  it("hides a whole tree, reports it as removed, and brings it back on newer activity", () => {
+    const result = store(session, subagent, { kind: "pstack", id: root }, activity(child, "2026-10-09T10:00:00Z"), otherSession);
+    result.flush();
+    const unhidden: AgentId[] = [];
+    result.onUnhide = (id) => unhidden.push(id);
+    expect(result.hide(child, Date.parse("2026-10-09T10:05:00Z"))).toBe(root);
+    expect(result.nodes("all").map((node) => node.id)).toEqual([other]);
+    expect(result.isHidden(root)).toBe(true);
+    expect(result.hiddenRoots()).toEqual([root]);
+    const flush = result.flush()!;
+    expect([...flush.removals].sort()).toEqual([root, child].sort());
+    expect(flush.upserts).toEqual([]);
+    result.apply(activity(child, "2026-10-09T10:04:00Z"));
+    expect(result.isHidden(root)).toBe(true);
+    result.apply(activity(child, "2026-10-09T10:06:00Z"));
+    expect(result.isHidden(root)).toBe(false);
+    expect(unhidden).toEqual([root]);
+    expect(result.flush()!.upserts.map((node) => node.id).sort()).toEqual([root, child].sort());
+  });
+
+  it("hides nothing it does not know and clears every hide at once", () => {
+    const result = store(session, subagent, otherSession);
+    expect(result.hide("claude:nope" as AgentId, 1)).toBeNull();
+    result.hide(root, Date.now());
+    result.hide(other, Date.now());
+    expect(result.nodes("all")).toEqual([]);
+    expect(result.clearHidden()).toBe(2);
+    expect(result.nodes("all").length).toBe(3);
+  });
+
+  it("starts from a hide list and keeps hides that are still current", () => {
+    const result = new Store();
+    result.setHidden(new Map([[root, Date.parse("2026-10-09T10:05:00Z")]]));
+    result.apply(session);
+    result.apply(activity(root, "2026-10-09T10:00:00Z"));
+    expect(result.nodes("all")).toEqual([]);
+    result.apply(activity(root, "2026-10-09T10:10:00Z"));
+    expect(result.nodes("all").map((node) => node.id)).toEqual([root]);
+  });
+});
+
+describe("forgetting agents", () => {
+  it("drops the agent, its process, and reports the removal once", () => {
+    const result = store(session, subagent, pidFile("busy"));
+    result.flush();
+    result.forget([child, "claude:unknown" as AgentId]);
+    expect(result.has(child)).toBe(false);
+    expect(result.nodes("all").map((node) => node.id)).toEqual([root]);
+    expect(result.flush()!.removals).toEqual([child]);
+    result.forget([root]);
+    expect(result.process(root)).toBeNull();
+    expect(result.probeTargets()).toEqual([]);
+    expect(result.flush()!.removals).toEqual([root]);
+    expect(result.flush()).toBeNull();
   });
 });
 

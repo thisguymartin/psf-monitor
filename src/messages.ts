@@ -6,7 +6,6 @@ import type { Store } from "./store.ts";
 import type { PromptMessage, PromptMode } from "./wire.ts";
 
 export function messageTarget(store: Store, id: AgentId): AgentNode | null {
-  if (!store.isPstack(id)) return null;
   let node = store.node(id);
   const seen = new Set<AgentId>();
   while (node !== null && !seen.has(node.id)) {

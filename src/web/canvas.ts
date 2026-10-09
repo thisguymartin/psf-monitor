@@ -216,7 +216,8 @@ export class Canvas {
     this.skillsButton.setAttribute("aria-pressed", String(shown));
   }
 
-  private resetLayout(): void {
+  /** Puts every card of the current session back where the layout placed it. Reset all calls this for the open session. */
+  resetLayout(): void {
     if (this.rootId === null || this.base === null) return;
     this.offsets = clearOffsets();
     storeOffsets(this.rootId, this.offsets);

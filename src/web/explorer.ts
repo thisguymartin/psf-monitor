@@ -1,5 +1,5 @@
 import type { AgentId, AgentNode } from "../domain.ts";
-import { filterTree, type AgentFilter, type StatusFilter } from "../explorer.ts";
+import { branchHealth, filterTree, type AgentFilter, type StatusFilter } from "../explorer.ts";
 import { activityLine, compactNumber, kindLabel, modelOf, stalled, statusLine } from "../format.ts";
 import { tokenTotal, type Tree } from "../graph.ts";
 import { h, icon, type IconName } from "./dom.ts";
@@ -34,7 +34,10 @@ export class Explorer {
   private readonly skills = h("input", { attrs: { type: "checkbox" } });
   private readonly count = h("span", { class: "explorer-count", attrs: { role: "status" } });
   private readonly list = h("div", { class: "explorer-list" });
-  private readonly notice = h("div", { class: "explorer-notice", attrs: { hidden: "" } });
+  private readonly noticeTitle = h("h2");
+  private readonly noticeBody = h("p");
+  private readonly scopeAction = h("button", { class: "quiet-action empty-scope-action", text: "Show all sessions", attrs: { type: "button", hidden: "" } });
+  private readonly notice = h("div", { class: "explorer-notice", attrs: { hidden: "" } }, this.noticeTitle, this.noticeBody, this.scopeAction);
   private readonly expand = h("button", { class: "quiet-action", text: "Expand all", attrs: { type: "button" } });
   private readonly collapse = h("button", { class: "quiet-action", text: "Collapse all", attrs: { type: "button" } });
   private readonly reset = h("button", { class: "quiet-action", text: "Clear filters", attrs: { type: "button" } });
@@ -46,7 +49,7 @@ export class Explorer {
   private now = Date.now();
   private message: string | null = null;
 
-  constructor(private readonly events: { change(): void; select(id: AgentId): void; skills(shown: boolean): void }) {
+  constructor(private readonly events: { change(): void; select(id: AgentId): void; skills(shown: boolean): void; allSessions(): void }) {
     const views = h("div", { class: "explorer-views", attrs: { role: "group", "aria-label": "Session view" } });
     for (const [mode, label, glyph] of [["tree", "Nested", "sessions"], ["runs", "Runs", "terminal"], ["graph", "Graph", "agent"]] as const) {
       const button = h("button", { attrs: { type: "button", "aria-pressed": String(mode === this.mode) }, on: { click: () => {
@@ -70,11 +73,8 @@ export class Explorer {
       else this.events.change();
     });
     this.skills.addEventListener("change", () => this.events.skills(this.skills.checked));
-    this.reset.addEventListener("click", () => {
-      this.filter.query = ""; this.filter.status = "all"; this.filter.kind = "all";
-      this.search.value = ""; this.status.value = "all"; this.kind.value = "all";
-      this.events.change();
-    });
+    this.reset.addEventListener("click", () => this.clearFilters());
+    this.scopeAction.addEventListener("click", () => this.events.allSessions());
     this.expand.addEventListener("click", () => this.expandAll(true));
     this.collapse.addEventListener("click", () => this.expandAll(false));
     this.content = h("div", { class: "explorer-content" }, this.list, this.graphHost, this.notice);
@@ -86,9 +86,15 @@ export class Explorer {
   }
 
   get isGraph(): boolean { return this.mode === "graph"; }
+
+  clearFilters(): void {
+    this.filter.query = ""; this.filter.status = "all"; this.filter.kind = "all";
+    this.search.value = ""; this.status.value = "all"; this.kind.value = "all";
+    this.events.change();
+  }
   private get filtering(): boolean { return this.filter.query.trim() !== "" || this.filter.status !== "all" || this.filter.kind !== "all"; }
 
-  render(tree: Tree | null, selected: AgentId | null, now: number, skillsShown: boolean, message: string | null): Tree | null {
+  render(tree: Tree | null, selected: AgentId | null, now: number, skillsShown: boolean, message: string | null, offerAllSessions: boolean): Tree | null {
     this.tree = tree; this.selected = selected; this.now = now; this.message = message;
     this.skills.checked = skillsShown;
     if (!skillsShown && this.filter.kind === "skill") { this.filter.kind = "all"; this.kind.value = "all"; }
@@ -106,7 +112,9 @@ export class Explorer {
       : `${tree.nodes.length} entries · ${this.mode === "tree" ? "Expand a branch to explore its agents" : this.mode === "runs" ? "Expand a run for its task and latest activity" : "Select a node to inspect it"}`;
     const empty = message ?? (tree === null ? "Select a session to explore its agents." : matches === 0 ? "No agents match these filters. Clear filters to see the whole session." : null);
     this.notice.hidden = empty === null;
-    this.notice.replaceChildren(h("h2", { text: matches === 0 && tree !== null && message === null ? "No matching agents" : "Session activity" }), h("p", { text: empty ?? "" }));
+    this.noticeTitle.textContent = matches === 0 && tree !== null && message === null ? "No matching agents" : "Session activity";
+    this.noticeBody.textContent = empty ?? "";
+    this.scopeAction.hidden = !offerAllSessions;
     this.draw(filtered?.tree ?? null, filtered?.matches ?? new Set());
     return filtered === null || matches === 0 ? null : filtered.tree;
   }
@@ -128,6 +136,7 @@ export class Explorer {
     if (this.mode === "runs") {
       for (const node of tree.nodes) if (matches.has(node.id)) this.list.append(this.run(node));
     } else {
+      const health = branchHealth(tree, this.now);
       const visit = (node: AgentNode): HTMLLIElement => {
         const children = tree.children.get(node.id) ?? [];
         const open = this.filtering || (this.branches.get(node.id) ?? node.id === tree.root.id);
@@ -135,8 +144,13 @@ export class Explorer {
         toggle.disabled = children.length === 0 || this.filtering;
         if (children.length === 0) toggle.style.visibility = "hidden";
         toggle.addEventListener("click", () => { this.branches.set(node.id, !open); this.events.change(); });
+        const descendants = health.get(node.id);
+        const branchSummary = !open && descendants !== undefined
+          ? (["failed", "running", "stalled"] as const).filter((status) => descendants[status] > 0).map((status) =>
+            h("span", { class: "explorer-branch-health", text: `${descendants[status]} ${status} inside`, attrs: { "data-status": status } }))
+          : [];
         const select = h("button", { class: "explorer-agent", attrs: { type: "button", "data-focus": `agent:${node.id}`, "aria-current": String(this.selected === node.id) }, on: { click: () => this.events.select(node.id) } },
-          this.glyph(node), h("span", { class: "explorer-identity" }, h("strong", { text: node.title }), h("span", { class: "explorer-activity", text: activityLine(node) ?? kindLabel(node) })),
+          this.glyph(node), h("span", { class: "explorer-identity" }, h("strong", { text: node.title }), h("span", { class: "explorer-activity", text: activityLine(node) ?? kindLabel(node) }), branchSummary.length > 0 ? h("span", { class: "explorer-branch-summary" }, ...branchSummary) : null),
           h("span", { class: "explorer-model", text: modelOf(node) ?? kindLabel(node) }), this.statusLabel(node),
           children.length > 0 ? h("span", { class: "explorer-child-count", text: `${children.length} inside` }) : null);
         const row = h("div", { class: "explorer-row", attrs: { "data-context": String(!matches.has(node.id)), "data-selected": String(this.selected === node.id) } }, toggle, select);
@@ -162,13 +176,16 @@ export class Explorer {
 
   private run(node: AgentNode): HTMLElement {
     const open = this.summaries.has(node.id);
+    const activity = activityLine(node);
     const parent = this.tree?.nodes.find((entry) => entry.id === node.parent);
     const bodyId = `run-${node.id}`;
     const summary = h("button", { class: "explorer-run-summary", attrs: { type: "button", "aria-expanded": String(open), "aria-controls": bodyId, "data-focus": `run:${node.id}` }, on: { click: () => {
       if (open) this.summaries.delete(node.id); else this.summaries.add(node.id);
       this.events.change();
     } } }, icon(open ? "chevronDown" : "chevronRight"), this.glyph(node),
-    h("span", { class: "explorer-identity" }, h("strong", { text: node.title }), h("span", { class: "explorer-activity", text: parent ? `${parent.title} / ${kindLabel(node)}` : kindLabel(node) })), this.statusLabel(node));
+    h("span", { class: "explorer-identity" }, h("strong", { text: node.title }), h("span", { class: "explorer-activity", text: parent ? `${parent.title} / ${kindLabel(node)}` : kindLabel(node) }),
+      activity ? h("span", { class: "explorer-activity", text: activity }) : null), this.statusLabel(node));
+    const transcript = h("button", { class: "quiet-action explorer-run-open", attrs: { type: "button", "data-focus": `transcript:${node.id}`, "aria-label": `Open transcript for ${node.title}` }, on: { click: () => this.events.select(node.id) } }, icon("terminal"), "Open transcript");
     const body = h("div", { class: "explorer-run-body", attrs: { id: bodyId } });
     body.hidden = !open;
     if (open) {
@@ -177,8 +194,7 @@ export class Explorer {
         if (text) body.append(h("h3", { text: label }), h("pre", { class: "explorer-output", text, attrs: { "data-output": `${node.id}:${label}`, "data-focus": `output:${node.id}:${label}`, tabindex: "0", "aria-label": `${node.title}: ${label}` } }));
       }
       if (!node.prompt && !activityLine(node) && !node.result) body.append(h("p", { text: "No activity summary recorded yet." }));
-      body.append(h("button", { class: "quiet-action explorer-open", attrs: { type: "button", "data-focus": `transcript:${node.id}` }, on: { click: () => this.events.select(node.id) } }, icon("terminal"), "Open transcript", icon("arrowRight")));
     }
-    return h("article", { class: "explorer-run", attrs: { "data-selected": String(this.selected === node.id) } }, summary, body);
+    return h("article", { class: "explorer-run", attrs: { "data-selected": String(this.selected === node.id) } }, h("div", { class: "explorer-run-header" }, summary, transcript), body);
   }
 }

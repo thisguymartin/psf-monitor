@@ -7,7 +7,7 @@ import { applyOffsets, clearOffsets, moveNode, moveSubtree } from "./offsets.ts"
 const id = (value: string) => value as AgentId;
 function node(name: string, parent: string | null): AgentNode {
   return {
-    id: id(name), parent: parent === null ? null : id(parent), via: null, spawnCall: null,
+    id: id(name), parent: parent === null ? null : id(parent), via: null, spawnCall: null, pstack: true,
     harness: "claude", source: "claude-session", flavor: parent === null ? { kind: "session" } : { kind: "subagent", agentType: null },
     title: name, cwd: null, model: { provider: "claude", requested: null, reported: null, effort: null },
     status: { kind: "done", at: null }, startedAt: null, lastActivityAt: null, activity: null,

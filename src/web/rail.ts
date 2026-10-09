@@ -1,4 +1,4 @@
-import type { AgentId, AgentNode } from "../domain.ts";
+import type { AgentId, AgentNode, Scope } from "../domain.ts";
 import { activityLine, ago, kindLabel, working } from "../format.ts";
 import { h, icon, providerIcon } from "./dom.ts";
 
@@ -6,7 +6,16 @@ import { h, icon, providerIcon } from "./dom.ts";
 
 export interface RailEvents {
   select(root: AgentId): void;
+  scope(next: Scope): void;
+  close(): void;
 }
+
+export const SCOPE_LABEL: Record<Scope, string> = { pstack: "pstack sessions", normal: "Other sessions", all: "All sessions" };
+const SCOPE_EMPTY: Record<Scope, string> = {
+  pstack: "No pstack sessions yet.",
+  normal: "No other sessions in this window.",
+  all: "No sessions in this window.",
+};
 
 export interface Descendants {
   readonly total: number;
@@ -50,10 +59,15 @@ export class Rail {
   private readonly count: HTMLElement;
   private readonly foot: HTMLElement;
   private readonly empty: HTMLElement;
+  private readonly scopeSelect: HTMLSelectElement;
+  private scope: Scope = "pstack";
 
   constructor(private readonly events: RailEvents) {
     this.title = h("span", { class: "rail-title" });
     this.count = h("span", { class: "rail-count" });
+    this.scopeSelect = h("select", { class: "rail-scope", attrs: { "aria-label": "Which sessions to list" } },
+      ...(Object.keys(SCOPE_LABEL) as Scope[]).map((scope) => h("option", { text: SCOPE_LABEL[scope], attrs: { value: scope } })));
+    this.scopeSelect.addEventListener("change", () => this.events.scope(this.scopeSelect.value as Scope));
     const sections = GROUPS.map(({ key, label }) => {
       const list = h("ul", { class: "sessions" });
       const section = h("section", { class: "rail-group", attrs: { "data-group": key } }, h("h2", { class: "rail-heading", text: label }), list);
@@ -63,10 +77,11 @@ export class Rail {
     });
     this.empty = h("p", { class: "rail-empty" });
     this.foot = h("p", { class: "rail-foot" });
+    const close = h("button", { class: "icon-button rail-close", attrs: { type: "button", "aria-label": "Close sessions" }, on: { click: () => this.events.close() } }, icon("close"));
     this.element = h(
       "nav",
-      { class: "rail", attrs: { "aria-label": "Sessions" } },
-      h("header", { class: "rail-head" }, h("span", { class: "rail-names" }, this.title, this.count)),
+      { class: "rail", attrs: { id: "session-navigation", "aria-label": "Sessions" } },
+      h("header", { class: "rail-head" }, h("span", { class: "rail-names" }, this.title, this.count), this.scopeSelect, close),
       h("div", { class: "rail-scroll" }, ...sections, this.empty),
       this.foot,
     );
@@ -78,7 +93,12 @@ export class Rail {
     selected: AgentId | null,
     now: number,
     footer: string,
+    scope: Scope,
   ): void {
+    const focused = document.activeElement instanceof HTMLElement && this.element.contains(document.activeElement)
+      ? document.activeElement.dataset.session : undefined;
+    this.scope = scope;
+    this.scopeSelect.value = scope;
     const rows = new Map<Group, HTMLElement[]>(GROUPS.map(({ key }) => [key, []]));
     for (const root of roots) {
       const counts = descendants.get(root.id);
@@ -90,11 +110,15 @@ export class Rail {
       this.lists.get(key)!.replaceChildren(...items);
       this.groups.get(key)!.hidden = items.length === 0;
     }
-    this.title.textContent = "pstack sessions";
-    this.empty.textContent = "No pstack sessions yet.";
+    this.title.textContent = scope === "pstack" ? "pstack" : scope === "normal" ? "Other" : "All";
+    this.empty.textContent = SCOPE_EMPTY[scope];
     this.empty.hidden = roots.length > 0;
     this.count.textContent = String(roots.length);
     this.foot.textContent = footer;
+    if (focused !== undefined) {
+      const target = Array.from(this.element.querySelectorAll<HTMLButtonElement>("[data-session]")).find((button) => button.dataset.session === focused);
+      (target ?? this.scopeSelect).focus({ preventScroll: true });
+    }
   }
 
   private row(root: AgentNode, counts: Descendants | undefined, group: Group, selected: boolean, now: number): HTMLElement {
@@ -108,6 +132,7 @@ export class Rail {
         title: `${root.title}\n${kindLabel(root)}${root.cwd === null ? "" : `\n${root.cwd}`}`,
         attrs: {
           type: "button",
+          "data-session": root.id,
           "data-group": group,
           "data-status": root.status.kind,
           "data-harness": root.harness,
@@ -127,6 +152,7 @@ export class Rail {
           class: "session-side",
           attrs: { "aria-label": `${total} ${total === 1 ? "agent" : "agents"}, ${skills} ${skills === 1 ? "skill" : "skills"}${running > 0 ? `, ${running} running` : ""}` },
         },
+        this.scope !== "pstack" && root.pstack ? h("span", { class: "session-tag", text: "pstack", title: "This session ran pstack" }) : null,
         total > 0 ? h("span", { class: "session-count", attrs: { "data-running": String(running > 0) } }, icon("agent"), h("span", { text: String(total) })) : null,
         skills > 0 ? h("span", { class: "session-count", text: `${skills} ${skills === 1 ? "skill" : "skills"}` }) : null,
         h("span", { class: "session-dot", attrs: { "aria-hidden": "true" } }),

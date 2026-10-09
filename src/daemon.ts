@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import type { AgentNode, Harness } from "./domain.ts";
 import { cancelLane } from "./control.ts";
 import { diskFileSystem } from "./fs.ts";
+import { HiddenSessions } from "./hidden.ts";
 import { lockInstance } from "./instance-lock.ts";
 import { journalOn, pruneLanes } from "./journal.ts";
 import { Monitor } from "./monitor.ts";
@@ -15,6 +16,7 @@ import { psTable } from "./probe.ts";
 import { clearRecord, readRecord, serverUrl, writeRecord, type ServerRecord } from "./record.ts";
 import { createHandler, type Assets } from "./server.ts";
 import { readSetup } from "./setup.ts";
+import { applySheetRequest } from "./sheets.ts";
 import { adapters, type Homes } from "./sources.ts";
 import { monitorVersion } from "./version.ts";
 import type { Snapshot } from "./wire.ts";
@@ -93,8 +95,8 @@ function logTail(path: string): string {
 }
 
 /** The setup as this process sees it: its own environment and PATH. */
-export function diskSetup(where: Homes) {
-  return readSetup({ where, fs: diskFileSystem, env: process.env, which: (command) => Bun.which(command), home: homedir(), platform: process.platform });
+export function diskSetup(where: Homes, cwds: readonly string[] = []) {
+  return readSetup({ where, fs: diskFileSystem, env: process.env, which: (command) => Bun.which(command), home: homedir(), platform: process.platform, cwds });
 }
 
 async function runningRecord(where: Homes): Promise<ServerRecord | null> {
@@ -137,6 +139,7 @@ async function serveLocked(where: Homes, options: ServeOptions, io: Io): Promise
   const version = monitorVersion();
   const instance = randomBytes(8).toString("hex");
   const token = randomBytes(24).toString("base64url");
+  const hidden = new HiddenSessions(where.state);
   const monitor = new Monitor({
     adapters: adapters(where),
     fs: diskFileSystem,
@@ -145,6 +148,7 @@ async function serveLocked(where: Homes, options: ServeOptions, io: Io): Promise
     version,
     instance,
     lanes: where.lanes,
+    hidden,
   });
   let resolveStopped: () => void = () => {};
   const stopped = new Promise<void>((resolve) => { resolveStopped = resolve; });
@@ -156,7 +160,8 @@ async function serveLocked(where: Homes, options: ServeOptions, io: Io): Promise
     assets: await options.assets(),
     lanes: where.lanes,
     cancel: (id) => cancelLane(monitor.store, psTable, id),
-    setup: () => diskSetup(where),
+    setup: () => diskSetup(where, monitor.store.cwds()),
+    sheet: (request) => applySheetRequest(request, diskSetup(where, monitor.store.cwds())),
     stop: resolveStopped,
   });
   let server: ReturnType<typeof Bun.serve>;
@@ -164,6 +169,7 @@ async function serveLocked(where: Homes, options: ServeOptions, io: Io): Promise
     server = Bun.serve({ hostname: "127.0.0.1", port: options.port, fetch: (request, bun) => handler(request, bun) });
   } catch (error) {
     inbox.close();
+    hidden.close();
     io.stderr(`port ${options.port} is unavailable: ${error instanceof Error ? error.message : String(error)}\n`);
     return 69;
   }
@@ -185,6 +191,7 @@ async function serveLocked(where: Homes, options: ServeOptions, io: Io): Promise
   } finally {
     monitor.stop();
     inbox.close();
+    hidden.close();
     server.stop(true);
     clearRecord(where.state, instance);
     process.removeListener("SIGTERM", resolveStopped);

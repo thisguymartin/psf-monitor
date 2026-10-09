@@ -1,7 +1,7 @@
-import type { AgentId, AgentNode, Harness, MessageLink, SourceKind } from "../domain.ts";
+import { SCOPES, type AgentId, type AgentNode, type Harness, type MessageLink, type Scope, type SourceKind } from "../domain.ts";
 import { compactNumber, shortPath, working } from "../format.ts";
 import { countsOf, isLive, rootOf, rootsOf, treeOf, withoutSkills } from "../graph.ts";
-import type { Delta, JournalResponse, PstackSetup, ServerInfo, Snapshot, SourceHealth, TimelineAppend, TimelinePage } from "../wire.ts";
+import type { Delta, JournalRequest, JournalResponse, JournalState, PstackSetup, ResetResponse, ServerInfo, SheetWriteRequest, SheetWriteResponse, Snapshot, SourceHealth, TimelineAppend, TimelinePage } from "../wire.ts";
 import { Canvas } from "./canvas.ts";
 import { Explorer } from "./explorer.ts";
 import { postJson } from "./commands.ts";
@@ -9,6 +9,8 @@ import { h, icon, logo } from "./dom.ts";
 import { Panel, PANEL_MIN } from "./panel.ts";
 import { Rail, type Descendants } from "./rail.ts";
 import { SetupView } from "./setup.ts";
+import { Overview } from "./overview.ts";
+import { Navigation, PAGE_LABEL, PAGES, isSetupPage, pageFromHash, type Page } from "../navigation.ts";
 
 // The page controller: one event stream, one state,
 // and a render that every view reads from.
@@ -24,6 +26,39 @@ const RETRY_MS = 3_000;
 /** Canvas kept visible beside the panel; narrower than this and the panel overlays it. */
 const CANVAS_MIN = 360;
 const SKILLS_KEY = "psf-monitor.skills-shown";
+const SCOPE_KEY = "psf-monitor.scope";
+/** Every per-session card layout lives under this prefix; Reset all clears them together. */
+const OFFSET_PREFIX = "psf-monitor.offsets.";
+
+function isScope(value: unknown): value is Scope {
+  return typeof value === "string" && (SCOPES as readonly string[]).includes(value);
+}
+
+/** The link's `scope` wins for this opening; otherwise the last choice on this browser; otherwise pstack only. */
+function initialScope(fromLink: string | null): Scope {
+  if (isScope(fromLink)) return fromLink;
+  try {
+    const stored = localStorage.getItem(SCOPE_KEY);
+    if (isScope(stored)) return stored;
+  } catch { /* Storage is unavailable. */ }
+  return "pstack";
+}
+
+function storeScope(scope: Scope): void {
+  try { localStorage.setItem(SCOPE_KEY, scope); }
+  catch { /* The choice lasts for this page only. */ }
+}
+
+function clearStoredLayouts(): void {
+  try {
+    const keys: string[] = [];
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = localStorage.key(index);
+      if (key !== null && key.startsWith(OFFSET_PREFIX)) keys.push(key);
+    }
+    for (const key of keys) localStorage.removeItem(key);
+  } catch { /* Nothing stored. */ }
+}
 
 function storedSkillsShown(): boolean {
   try { return localStorage.getItem(SKILLS_KEY) !== "false"; }
@@ -36,8 +71,7 @@ function storeSkillsShown(shown: boolean): void {
 }
 
 type Connection = "connecting" | "live" | "retrying" | "expired" | "stopped";
-type View = "sessions" | "setup";
-const SETUP_HASH = "#setup";
+type View = Page;
 
 interface State {
   nodes: Map<AgentId, AgentNode>;
@@ -49,8 +83,11 @@ interface State {
   connection: Connection;
   dismissed: string;
   view: View;
+  scope: Scope;
   setup: PstackSetup | null;
   setupError: string | null;
+  journal: JournalState | null;
+  journalError: string | null;
 }
 
 const params = new URLSearchParams(location.search);
@@ -66,9 +103,12 @@ const state: State = {
   agent: null,
   connection: "connecting",
   dismissed: "",
-  view: location.hash === SETUP_HASH ? "setup" : "sessions",
+  view: pageFromHash(location.hash),
+  scope: initialScope(params.get("scope")),
   setup: null,
   setupError: null,
+  journal: null,
+  journalError: null,
 };
 
 let skillsShown = storedSkillsShown();
@@ -82,7 +122,7 @@ function setSkillsShown(shown: boolean): void {
   else render();
 }
 
-const explorer = new Explorer({ change: () => render(), select: (id) => selectAgent(id), skills: setSkillsShown });
+const explorer = new Explorer({ change: () => render(), select: (id) => selectAgent(id), skills: setSkillsShown, allSessions: () => setScope("all") });
 const canvas = new Canvas({ select: (id) => selectAgent(id), toggleSkills: () => setSkillsShown(!skillsShown) });
 explorer.graphHost.append(canvas.element);
 canvas.setSkillsShown(skillsShown);
@@ -92,23 +132,39 @@ const panel = new Panel({
   loadOlder: (agent, before) => fetchTimeline(agent, before),
   resized: (width, settled) => setRightInset(insetFor(width), settled),
 });
-const rail = new Rail({ select: (root) => selectSession(root) });
-const setupView = new SetupView({ refresh: () => void fetchSetup() });
+const rail = new Rail({ select: (root) => selectSession(root), scope: (next) => setScope(next), close: () => toggleRail(false) });
+const setupView = new SetupView({ refresh: () => void fetchSetup(), journal: (request) => changeJournal(request), sheet: (request) => writeSheet(request) });
 
-const sessionTitle = h("h1", { class: "bar-title" });
+const overview = new Overview({
+  navigate: (page) => { if ((PAGES as readonly string[]).includes(page)) setView(page as Page); },
+  select: (id) => { setView("sessions"); selectAgent(id); panel.focus(); },
+});
+const sessionTitle = h("h1", { class: "bar-title", attrs: { tabindex: "-1" } });
 const sessionPath = h("span", { class: "bar-path mono" });
 const stats = h("div", { class: "bar-stats", attrs: { "aria-label": "This session" } });
 const liveText = h("span", { class: "live-text" });
 const live = h("div", { class: "live", attrs: { role: "status" } }, h("span", { class: "live-dot", attrs: { "aria-hidden": "true" } }), liveText);
-const railToggle = h("button", { class: "icon-button rail-toggle", title: "Sessions", attrs: { type: "button", "aria-label": "Show sessions" } }, icon("sessions"));
+const railToggle = h("button", { class: "icon-button rail-toggle", title: "Navigation", attrs: { type: "button", "aria-label": "Open navigation", "aria-controls": "workspace-navigation", "aria-expanded": "false" } }, icon("sessions"));
 railToggle.addEventListener("click", () => toggleRail());
 const banner = h("div", { class: "banner", attrs: { hidden: "", role: "note" } });
 const viewButton = h("button", { class: "quiet-action", attrs: { type: "button" } });
-viewButton.addEventListener("click", () => setView(state.view === "setup" ? "sessions" : "setup"));
+viewButton.addEventListener("click", () => navigation.back());
 const journalButton = h("button", { class: "quiet-action", attrs: { type: "button" } });
+const resetButton = h("button", { class: "quiet-action", attrs: { type: "button" }, title: "Show hidden sessions again, clear filters, and put every card back" });
 const stopButton = h("button", { class: "quiet-action", attrs: { type: "button" } }, icon("stop"), h("span", { text: "Stop monitor" }));
 const controlMessage = h("span", { class: "bar-command-message", attrs: { role: "status", hidden: "" } });
-const barControls = h("div", { class: "bar-controls" }, viewButton, journalButton, stopButton, controlMessage);
+const controlsSummary = h("summary", { class: "quiet-action", attrs: { "aria-label": "Monitor controls" } }, icon("sliders"), h("span", { text: "Monitor" }), icon("chevronDown"));
+const monitorControls = h("details", { class: "monitor-controls" }, controlsSummary,
+  h("div", { class: "monitor-menu" }, h("p", { class: "monitor-menu-title", text: "Monitor controls" }), journalButton, resetButton, stopButton, controlMessage));
+const barControls = h("div", { class: "bar-controls" }, viewButton, monitorControls);
+monitorControls.addEventListener("toggle", () => {
+  if (monitorControls.open) return;
+  journalConfirmUntil = stopConfirmUntil = resetConfirmUntil = 0;
+  renderControls();
+});
+document.addEventListener("click", (event) => {
+  if (event.target instanceof Node && !monitorControls.contains(event.target)) monitorControls.open = false;
+});
 
 const bar = h(
   "header",
@@ -123,19 +179,95 @@ const bar = h(
 
 let journalConfirmUntil = 0;
 let stopConfirmUntil = 0;
+let resetConfirmUntil = 0;
 let journalPending = false;
 let stopPending = false;
+let resetPending = false;
 
 function renderControls(): void {
-  viewButton.replaceChildren(icon(state.view === "setup" ? "sessions" : "sliders"), h("span", { text: state.view === "setup" ? "Sessions" : "Setup" }));
-  viewButton.title = state.view === "setup" ? "Back to session agents" : "pstack skills, providers, model roles, and settings";
+  viewButton.replaceChildren(icon("arrowLeft"), h("span", { text: "Back" }));
+  viewButton.hidden = state.view === "sessions";
+  viewButton.title = "Back to the previous page; Sessions when opened directly";
   const journal = state.server?.journal === true;
   const journalArmed = journal && journalConfirmUntil > Date.now();
   journalButton.replaceChildren(icon("lane"), h("span", { text: state.server === null ? "Journal…" : journalPending ? "Updating…" : journalArmed ? "Confirm: Delete recorded lanes?" : `Journal: ${journal ? "on" : "off"}` }));
   journalButton.title = journal ? "Turn off lane journal and delete its records" : "Turn on lane journal";
   journalButton.disabled = state.server === null || journalPending || state.connection === "stopped";
+  resetButton.replaceChildren(icon("reset"), h("span", { text: resetPending ? "Resetting…" : resetConfirmUntil > Date.now() ? "Confirm: Reset all?" : "Reset all" }));
+  resetButton.disabled = state.server === null || resetPending || state.connection === "stopped";
   stopButton.replaceChildren(icon("stop"), h("span", { text: stopPending ? "Stopping…" : stopConfirmUntil > Date.now() ? "Confirm: Stop monitor?" : "Stop monitor" }));
   stopButton.disabled = state.server === null || stopPending || state.connection === "stopped";
+}
+
+resetButton.addEventListener("click", () => {
+  if (resetConfirmUntil <= Date.now()) {
+    resetConfirmUntil = Date.now() + 4_000;
+    renderControls();
+    window.setTimeout(renderControls, 4_050);
+    return;
+  }
+  resetConfirmUntil = 0;
+  resetPending = true;
+  controlError("");
+  renderControls();
+  void (async () => {
+    try {
+      const { status, data } = await postJson<ResetResponse>("/api/reset", {});
+      if (status !== 200 || !data.ok) controlError(data.message);
+      else {
+        canvas.resetLayout();
+        clearStoredLayouts();
+        explorer.clearFilters();
+        controlError(data.message);
+        window.setTimeout(() => controlError(""), 4_000);
+        // The server re-sends anything it had hidden; a fresh snapshot is the simplest way to pick that up.
+        connect();
+      }
+    } catch {
+      controlError("Could not reach the monitor.");
+    }
+    resetPending = false;
+    renderControls();
+  })();
+});
+
+function setScope(next: Scope): void {
+  if (state.scope === next) return;
+  state.scope = next;
+  storeScope(next);
+  state.session = null;
+  if (state.agent !== null) {
+    state.agent = null;
+    panel.close();
+    setRightInset(0);
+  }
+  render();
+  connect();
+}
+
+async function writeSheet(request: SheetWriteRequest): Promise<SheetWriteResponse> {
+  let result: SheetWriteResponse;
+  try {
+    result = (await postJson<SheetWriteResponse>("/api/sheet", request)).data;
+  } catch {
+    result = { ok: false, message: "Could not reach the monitor.", path: null, errors: [], warnings: [] };
+  }
+  await fetchSetup();
+  return result;
+}
+
+async function changeJournal(request: JournalRequest): Promise<string | null> {
+  let error: string | null = null;
+  try {
+    const { status, data } = await postJson<JournalResponse>("/api/journal", request);
+    if (status !== 200 || !data.ok) error = data.message;
+    else if (state.server !== null) state.server = { ...state.server, journal: data.journal };
+  } catch {
+    error = "Could not reach the monitor.";
+  }
+  await fetchJournal();
+  render();
+  return error;
 }
 
 function controlError(message: string): void {
@@ -203,11 +335,45 @@ stopButton.addEventListener("click", () => {
 });
 
 const stage = h("main", { class: "stage" }, explorer.element, banner, panel.element);
+const narrowScreen = window.matchMedia("(max-width: 860px)");
+let detailTrigger: HTMLElement | null = null;
+let detailFocusKey: string | undefined;
+let detailInset = 0;
 const scrim = h("div", { class: "scrim", attrs: { "aria-hidden": "true" } });
 scrim.addEventListener("click", () => toggleRail(false));
-document.body.append(bar, rail.element, stage, setupView.element, scrim);
+const pageLinks = new Map<Page, HTMLAnchorElement>();
+const appNav = h("nav", { class: "app-nav", attrs: { "aria-label": "Workspace pages" } });
+for (const page of PAGES) {
+  const glyph = ({ overview: "activity", sessions: "sessions", providers: "globe", models: "sliders", skills: "skills", journal: "lane", settings: "tool" } as const)[page];
+  const link = h("a", { class: "app-nav-link", attrs: { href: `#${page}`, "data-page": page } }, icon(glyph), h("span", { text: PAGE_LABEL[page] }));
+  link.addEventListener("click", (event) => {
+    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    setView(page);
+  });
+  pageLinks.set(page, link);
+  appNav.append(link);
+}
+const navClose = h("button", { class: "icon-button workspace-close", attrs: { type: "button", "aria-label": "Close navigation" }, on: { click: () => toggleRail(false) } }, icon("close"));
+const navScope = h("select", { class: "rail-scope", attrs: { "aria-label": "Activity scope" } },
+  h("option", { text: "pstack sessions", attrs: { value: "pstack" } }), h("option", { text: "Other sessions", attrs: { value: "normal" } }), h("option", { text: "All sessions", attrs: { value: "all" } }));
+navScope.addEventListener("change", () => { if (isScope(navScope.value)) setScope(navScope.value); });
+const navContext = h("div", { class: "workspace-context" }, h("label", {}, h("span", { text: "Activity scope" }), navScope), h("p", { text: "Configuration is local to this machine." }));
+const sidebar = h("aside", { class: "workspace-sidebar", attrs: { id: "workspace-navigation", "aria-label": "Workspace navigation" } },
+  h("div", { class: "workspace-nav-head" }, h("span", { text: "Workspace" }), navClose), appNav, navContext, rail.element);
+document.body.append(bar, sidebar, stage, setupView.element, overview.element, scrim);
 document.body.dataset.view = state.view;
-setupView.element.hidden = state.view !== "setup";
+setupView.element.hidden = !isSetupPage(state.view);
+overview.element.hidden = state.view !== "overview";
+const navigation = new Navigation({
+  read: () => ({ pathname: location.pathname, search: location.search, hash: location.hash, state: history.state }),
+  push: (value, url) => history.pushState(value, "", url),
+  replace: (value, url) => history.replaceState(value, "", url),
+  back: () => history.back(),
+}, activateView);
+window.addEventListener("popstate", () => navigation.restore());
+window.addEventListener("hashchange", () => navigation.restore());
+window.addEventListener("beforeunload", (event) => { if (setupView.hasDraft) event.preventDefault(); });
 document.documentElement.dataset.harness = defaultHarness;
 
 // --- data ------------------------------------------------------------------
@@ -224,8 +390,9 @@ function connect(): void {
   source?.close();
   if (retryTimer !== null) window.clearTimeout(retryTimer);
   retryTimer = null;
-  const url = state.agent === null ? "/api/events" : `/api/events?watch=${encodeURIComponent(state.agent)}`;
-  const stream = new EventSource(url);
+  const query = new URLSearchParams({ scope: state.scope });
+  if (state.agent !== null) query.set("watch", state.agent);
+  const stream = new EventSource(`/api/events?${query.toString()}`);
   source = stream;
   stream.addEventListener("open", () => setConnection("live"));
   stream.addEventListener("snapshot", (event) => onSnapshot(JSON.parse((event as MessageEvent<string>).data) as Snapshot));
@@ -276,18 +443,42 @@ async function fetchSetup(): Promise<void> {
   } catch (error) {
     state.setupError = error instanceof TypeError ? "Could not reach the monitor." : error instanceof Error ? error.message : "Could not read the pstack setup.";
   }
+  await fetchJournal();
   render();
 }
 
+async function fetchJournal(): Promise<void> {
+  try {
+    const response = await fetch("/api/journal");
+    if (!response.ok) throw new Error("The monitor could not read the lane journal.");
+    state.journal = (await response.json()) as JournalState;
+    state.journalError = null;
+  } catch (error) {
+    state.journalError = error instanceof TypeError ? "Could not reach the monitor." : error instanceof Error ? error.message : "Could not read the lane journal.";
+  }
+}
+
 function setView(view: View): void {
+  if (view === state.view) toggleRail(false);
+  navigation.visit(view);
+}
+
+const pageScroll = new Map<Page, number>();
+function activateView(view: View): void {
   if (state.view === view) return;
+  if (isSetupPage(state.view)) pageScroll.set(state.view, setupView.element.scrollTop);
+  else if (state.view === "overview") pageScroll.set(state.view, overview.element.scrollTop);
   state.view = view;
   document.body.dataset.view = view;
-  setupView.element.hidden = view !== "setup";
-  history.replaceState(null, "", view === "setup" ? SETUP_HASH : `${location.pathname}${location.search}`);
+  setupView.element.hidden = !isSetupPage(view);
+  overview.element.hidden = view !== "overview";
   toggleRail(false);
-  if (view === "setup") void fetchSetup();
+  monitorControls.open = false;
+  if (view !== "sessions") void fetchSetup();
   render();
+  if (isSetupPage(view)) setupView.element.scrollTop = pageScroll.get(view) ?? 0;
+  else if (view === "overview") overview.element.scrollTop = pageScroll.get(view) ?? 0;
+  sessionTitle.focus({ preventScroll: true });
 }
 
 function onSnapshot(snapshot: Snapshot): void {
@@ -297,7 +488,11 @@ function onSnapshot(snapshot: Snapshot): void {
   state.server = snapshot.server;
   const shown = visibleNodes();
   if (state.session === null || !shown.has(state.session)) state.session = chooseSession();
-  if (state.agent !== null && !shown.has(state.agent)) state.agent = null;
+  if (state.agent !== null && !shown.has(state.agent)) {
+    state.agent = null;
+    panel.close();
+    setRightInset(0);
+  }
   setConnection("live");
   render();
 }
@@ -310,6 +505,12 @@ function onDelta(delta: Delta): void {
       pulses.push(node.id);
     }
     state.nodes.set(node.id, node);
+  }
+  for (const id of delta.removals) state.nodes.delete(id);
+  if (state.agent !== null && !state.nodes.has(state.agent)) {
+    state.agent = null;
+    panel.close();
+    setRightInset(0);
   }
   const talks: MessageLink[] = [];
   if (delta.links !== null) {
@@ -360,11 +561,19 @@ function selectAgent(id: AgentId | null): void {
   if (id === state.agent) return;
   const shown = visibleNodes();
   if (id !== null && !shown.has(id)) return;
+  if (id !== null && !panel.element.contains(document.activeElement)) {
+    detailTrigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    detailFocusKey = detailTrigger?.dataset.focus;
+  }
   state.agent = id;
   if (id === null) {
     panel.close();
     setRightInset(0);
     render();
+    const restored = detailFocusKey === undefined ? null : Array.from(explorer.element.querySelectorAll<HTMLElement>("[data-focus]")).find((element) => element.dataset.focus === detailFocusKey);
+    (restored ?? (detailTrigger?.isConnected ? detailTrigger : explorer.element.querySelector<HTMLInputElement>("input[type=search]")))?.focus({ preventScroll: true });
+    detailTrigger = null;
+    detailFocusKey = undefined;
     connect();
     return;
   }
@@ -376,6 +585,7 @@ function selectAgent(id: AgentId | null): void {
   render();
   setRightInset(insetFor(panel.width));
   if (explorer.isGraph) canvas.reveal(id);
+  panel.focus();
   // The stream carries the watched agent's timeline, so a new selection reconnects.
   connect();
 }
@@ -386,6 +596,8 @@ function insetFor(width: number): number {
 }
 
 function setRightInset(pixels: number, reveal = true): void {
+  detailInset = pixels;
+  syncNavigation();
   explorer.element.style.setProperty("--detail-inset", `${pixels}px`);
   canvas.setRightInset(pixels, reveal);
 }
@@ -395,11 +607,35 @@ function fitPanel(): void {
   setRightInset(state.agent === null ? 0 : insetFor(panel.width), false);
 }
 
-function toggleRail(open?: boolean): void {
-  const next = open ?? document.body.dataset.rail !== "open";
-  document.body.dataset.rail = next ? "open" : "closed";
-  railToggle.setAttribute("aria-expanded", String(next));
+function syncNavigation(): void {
+  const railOpen = narrowScreen.matches && document.body.dataset.rail === "open";
+  const detailCoversExplorer = state.agent !== null && (narrowScreen.matches || detailInset === 0);
+  sidebar.inert = narrowScreen.matches && !railOpen;
+  stage.inert = railOpen || state.view !== "sessions";
+  setupView.element.inert = railOpen || !isSetupPage(state.view);
+  overview.element.inert = railOpen || state.view !== "overview";
+  explorer.element.inert = detailCoversExplorer;
+  banner.inert = detailCoversExplorer;
+  panel.element.inert = state.agent === null;
+  railToggle.setAttribute("aria-expanded", String(railOpen));
 }
+
+function toggleRail(open?: boolean): void {
+  const wasOpen = document.body.dataset.rail === "open";
+  const next = narrowScreen.matches && (open ?? !wasOpen);
+  document.body.dataset.rail = next ? "open" : "closed";
+  syncNavigation();
+  if (next) (pageLinks.get(state.view) ?? navClose).focus();
+  else if (wasOpen && narrowScreen.matches) railToggle.focus();
+}
+
+narrowScreen.addEventListener("change", () => {
+  const focusedInRail = sidebar.contains(document.activeElement);
+  toggleRail(false);
+  if (focusedInRail && narrowScreen.matches) railToggle.focus();
+  fitPanel();
+  if (explorer.element.inert && explorer.element.contains(document.activeElement)) panel.focus();
+});
 
 // --- rendering -------------------------------------------------------------
 
@@ -416,23 +652,35 @@ function render(): void {
     descendants.set(root, { total: entry.total + (node.flavor.kind === "skill" ? 0 : 1), skills: entry.skills + (node.flavor.kind === "skill" ? 1 : 0), running: entry.running + (node.flavor.kind !== "skill" && working(node, now) ? 1 : 0) });
   }
   const hours = state.server?.windowHours ?? 24;
-  rail.render(roots, descendants, state.session, now, `All projects · Last ${hours} hours`);
+  rail.render(roots, descendants, state.session, now, `All projects · Last ${hours} hours`, state.scope);
 
   const tree = state.session === null ? null : treeOf(state.session, shown);
   const fullTree = state.session === null ? null : treeOf(state.session, all);
   const message = state.connection === "stopped" ? "Monitor stopped. Run psf-monitor start to start it again."
     : state.connection === "expired" ? "Link expired. Run psf-monitor start and open the new link."
-    : all.size === 0 ? state.server?.indexing === true ? "Reading recent transcripts…" : `No pstack sessions in the last ${hours} hours. Run a pstack skill in Claude Code or Codex to begin.`
+    : roots.length === 0 ? state.server === null ? "Connecting to the monitor…" : state.server.indexing ? "Reading recent transcripts…"
+      : state.scope === "pstack" ? `No pstack sessions in the last ${hours} hours. Run a pstack skill in Claude Code or Codex to begin, or switch the list to all sessions.`
+      : state.scope === "normal" ? `No sessions without pstack in the last ${hours} hours.`
+      : `No sessions in the last ${hours} hours.`
     : null;
-  const filtered = explorer.render(tree, state.agent, now, skillsShown, message);
+  const offerAllSessions = roots.length === 0 && state.scope !== "all" && state.server !== null && !state.server.indexing && state.connection === "live";
+  const filtered = explorer.render(tree, state.agent, now, skillsShown, message, offerAllSessions);
   if (explorer.isGraph) canvas.render(filtered, state.agent, now, state.links);
   document.documentElement.dataset.harness = tree?.root.harness ?? defaultHarness;
 
   canvas.setEmpty(null);
 
-  if (state.view === "setup") {
-    setupView.render({ setup: state.setup, error: state.setupError, nodes: all, server: state.server, now });
-    sessionTitle.textContent = "pstack setup";
+  for (const [page, link] of pageLinks) {
+    if (page === state.view) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
+  }
+  navScope.value = state.scope;
+  navContext.hidden = state.view === "sessions";
+  if (state.view !== "sessions") {
+    if (isSetupPage(state.view)) setupView.render({ page: state.view, scope: state.scope, setup: state.setup, error: state.setupError, journal: state.journal, journalError: state.journalError, nodes: all, server: state.server, now });
+    else overview.render({ nodes: all, health: state.health, server: state.server, setup: state.setup, scope: state.scope, now, connection: state.connection });
+    sessionTitle.textContent = PAGE_LABEL[state.view];
+    document.title = `${PAGE_LABEL[state.view]} · psf-monitor`;
     sessionPath.textContent = "";
     stats.replaceChildren();
   } else if (tree === null) {
@@ -465,6 +713,7 @@ function render(): void {
   renderBanner();
   renderLive();
   renderControls();
+  syncNavigation();
 }
 
 function stat(kind: string, value: number, label: string, shown = String(value)): HTMLElement {
@@ -532,15 +781,17 @@ window.setInterval(() => render(), 30_000);
 
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
-  if (state.view === "setup") {
-    // Escape first clears a search field; leave that to the field.
-    if (!(event.target instanceof HTMLInputElement)) setView("sessions");
-  } else if (document.body.dataset.rail === "open") toggleRail(false);
-  else if (state.agent !== null) selectAgent(null);
+  if (monitorControls.open) {
+    monitorControls.open = false;
+    controlsSummary.focus();
+    return;
+  }
+  if (document.body.dataset.rail === "open") toggleRail(false);
+  else if (state.view === "sessions" && state.agent !== null) selectAgent(null);
 });
 
 new ResizeObserver(() => fitPanel()).observe(stage);
 
-renderControls();
+render();
 connect();
-if (state.view === "setup") void fetchSetup();
+if (state.view !== "sessions") void fetchSetup();

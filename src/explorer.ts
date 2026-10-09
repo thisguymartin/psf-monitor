@@ -9,6 +9,30 @@ export interface AgentFilter {
   readonly kind: "all" | AgentNode["flavor"]["kind"];
 }
 
+export interface BranchHealth {
+  running: number;
+  failed: number;
+  stalled: number;
+}
+
+/** Descendant activity, excluding the branch itself and skill wrappers. */
+export function branchHealth(tree: Tree, now: number): ReadonlyMap<AgentId, BranchHealth> {
+  const health = new Map<AgentId, BranchHealth>(tree.nodes.map((node) => [node.id, { running: 0, failed: 0, stalled: 0 }]));
+  for (const node of tree.nodes.toReversed()) {
+    const own = health.get(node.id);
+    const parent = node.parent === null || node.id === tree.root.id ? undefined : health.get(node.parent);
+    if (own === undefined || parent === undefined) continue;
+    parent.running += own.running;
+    parent.failed += own.failed;
+    parent.stalled += own.stalled;
+    if (node.flavor.kind === "skill") continue;
+    if (stalled(node, now)) parent.stalled += 1;
+    else if (working(node, now)) parent.running += 1;
+    else if (node.status.kind === "failed") parent.failed += 1;
+  }
+  return health;
+}
+
 export function matchesAgent(node: AgentNode, filter: AgentFilter, now: number): boolean {
   const status = filter.status;
   if (status === "running" ? !working(node, now)

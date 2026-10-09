@@ -2,8 +2,9 @@ import { join } from "node:path";
 import type { Harness } from "./domain.ts";
 import type { FileSystem } from "./fs.ts";
 import { array, object, oneLine, parseJson, text } from "./json.ts";
+import { globalSheet, projectSetups, SHEET_TITLE } from "./sheets.ts";
 import type { Homes } from "./sources.ts";
-import type { GatewaySetup, ModelFamily, ModelSheet, PstackInstall, PstackSetup, ProviderSetup, SetupSetting, SheetRole, SkillInfo } from "./wire.ts";
+import type { GatewaySetup, ModelFamily, PstackInstall, PstackSetup, ProviderSetup, SetupSetting, SheetRole, SkillInfo } from "./wire.ts";
 
 // How pstack is set up on this machine: the installed plugin's skills and
 // model matrix, each provider's CLI and key, and the model sheets. Providers
@@ -13,8 +14,6 @@ import type { GatewaySetup, ModelFamily, ModelSheet, PstackInstall, PstackSetup,
 const MAX_FILE = 256 * 1024;
 const SKILL_HEAD = 8 * 1024;
 const PLUGIN = "pstack";
-const SHEET_NAME = "pstack-models.md";
-const SHEET_TITLE = "# pstack model configuration";
 
 export interface SetupOptions {
   readonly where: Homes;
@@ -24,6 +23,8 @@ export interface SetupOptions {
   /** Gateway config dirs default to `<home>/.pstack-flex/<provider>`. */
   readonly home: string;
   readonly platform: string;
+  /** Working directories of indexed sessions; each git project among them gets a project entry. */
+  readonly cwds?: readonly string[];
 }
 
 function configured(env: NodeJS.ProcessEnv, name: string): string | null {
@@ -238,12 +239,6 @@ export function parseSheet(sheet: string): SheetRole[] {
   return roles;
 }
 
-function sheet(fs: FileSystem, harness: Harness, home: string): ModelSheet {
-  const path = join(home, SHEET_NAME);
-  const body = fs.readText(path, MAX_FILE);
-  return { harness, path, present: body !== null, roles: body === null ? [] : parseSheet(body) };
-}
-
 // setup-pstack carries the first-run sheet as a fenced example; pstack uses those roles until a sheet exists.
 function defaultRoles(fs: FileSystem, install: string): SheetRole[] {
   const skill = fs.readText(join(install, "skills", "setup-pstack", "SKILL.md"), MAX_FILE) ?? "";
@@ -275,7 +270,8 @@ export function readSetup(options: SetupOptions): PstackSetup {
     installs: found,
     skills: install === null ? [] : skills(fs, install),
     providers: providers(matrix, options),
-    sheets: [sheet(fs, "claude", where.claude), sheet(fs, "codex", where.codex)],
+    sheets: [globalSheet(fs, "claude", where.claude, parseSheet), globalSheet(fs, "codex", where.codex, parseSheet)],
+    projects: projectSetups(options.cwds ?? [], fs, parseSheet),
     defaults: install === null ? [] : defaultRoles(fs, install),
     settings: settings(options),
     platform: options.platform,
@@ -310,8 +306,15 @@ export function renderSetup(setup: PstackSetup): string {
 
   const written = setup.sheets.filter((entry) => entry.present);
   for (const entry of written) {
-    lines.push("", `Model roles · ${HARNESS_NAME[entry.harness]} · ${entry.path}`);
+    lines.push("", `Model roles · ${HARNESS_NAME[entry.harness]} · ${entry.path}${entry.unprobed ? " · not probed" : ""}`);
     for (const role of entry.roles) lines.push(`  ${role.role}: ${role.lanes.join(", ")}`);
+  }
+  for (const project of setup.projects) {
+    for (const entry of project.sheets) {
+      if (!entry.present) continue;
+      lines.push("", `Model roles · ${project.name} · ${HARNESS_NAME[entry.harness]} · ${entry.path}${entry.unprobed ? " · not probed" : ""} (replaces the global sheet in this project)`);
+      for (const role of entry.roles) lines.push(`  ${role.role}: ${role.lanes.join(", ")}`);
+    }
   }
   if (written.length === 0 && setup.defaults.length > 0) {
     lines.push("", "Model roles · first-run defaults; no model sheet is written yet");

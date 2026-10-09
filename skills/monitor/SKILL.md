@@ -13,6 +13,7 @@ Run one command and relay its output.
 | stop, kill, close, or shut down the monitor | `psf-monitor stop` |
 | check whether it is running, or get the link again | `psf-monitor status` |
 | list pstack's skills, providers, model roles, or settings, or ask whether DeepSeek, MiniMax, or another provider is ready | `psf-monitor setup` |
+| list recorded lanes, or delete one or all of them | `psf-monitor journal list`, `psf-monitor journal rm <lane id>`, `psf-monitor journal clear` |
 
 The launcher is `<base directory>/../../bin/psf-monitor`, where `<base directory>` is this skill's base directory as an absolute path. Run it by that absolute path, never as a path relative to the current directory. Pass the harness you are running in as `--parent`.
 
@@ -22,13 +23,15 @@ The monitor is global across projects in the configured harness directories, not
 
 OpenCode native sessions are read from its local SQLite database, including child sessions and OpenCode runner lane output. Messaging supports Claude Code and Codex only.
 
-The page shows pstack sessions only. A session appears once it runs a pstack skill or command, spawns a pstack agent, or launches a pstack lane.
+The page lists pstack sessions by default. A session counts as pstack once it runs a pstack skill or command, spawns a pstack agent, or launches a pstack lane. The select above the session list switches to other sessions or all sessions; a link can open that way with `&scope=all`. The user can hide a session from its panel; it returns when active again, or when they click **Reset all** in the top bar.
 
-The first `start` also turns on pstack's lane journal and says so on stderr. Relay that line: lane output is kept on disk for 7 days, and `psf-monitor journal off` stops it and deletes what it kept.
+The first `start` also turns on pstack's lane journal and says so on stderr. Relay that line: lane output is kept on disk for 7 days, and `psf-monitor journal off` stops it and deletes what it kept. `journal clear` deletes the records and keeps recording; `journal rm <lane id>` deletes one. The page lists and deletes them under **Setup → Journal**. Deleting or clearing is irreversible: confirm with the user before running `rm`, `clear`, or `off` unless they named the action themselves.
 
 `stop` ends the monitor only, never an agent. To cancel a running pstack lane, the user clicks Cancel in that lane's panel on the page. To stop a Claude Code, Codex, or OpenCode session, the user interrupts it in its own terminal.
 
-`setup` prints which providers can run a lane and what stops the others; it reports whether an API key is set, never the key. The page shows the same under **Setup**, with the commands that store and load a missing key. To change a role's model, the user runs `/pstack:setup-pstack`.
+`setup` prints which providers can run a lane and what stops the others; it reports whether an API key is set, never the key. It also prints the model sheets for the current project and the global ones. The page shows the same under **Setup**, with the commands that store and load a missing key.
+
+Under **Setup → Model roles** the user can pick a project's sheet or the global one and change which model and effort each role runs on, move every lane to one model, or create and delete a project sheet. The monitor validates against the installed matrix but does not probe models; a sheet it wrote shows **not probed**. When the user wants a lane proven, or wants a global sheet created, point them to `/pstack:setup-pstack`.
 
 `psf-monitor doctor` reports how well recent transcripts parsed. Run it when the page warns that a source is degraded, and relay the result.
 
