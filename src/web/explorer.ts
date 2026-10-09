@@ -70,11 +70,7 @@ export class Explorer {
       else this.events.change();
     });
     this.skills.addEventListener("change", () => this.events.skills(this.skills.checked));
-    this.reset.addEventListener("click", () => {
-      this.filter.query = ""; this.filter.status = "all"; this.filter.kind = "all";
-      this.search.value = ""; this.status.value = "all"; this.kind.value = "all";
-      this.events.change();
-    });
+    this.reset.addEventListener("click", () => this.clearFilters());
     this.expand.addEventListener("click", () => this.expandAll(true));
     this.collapse.addEventListener("click", () => this.expandAll(false));
     this.content = h("div", { class: "explorer-content" }, this.list, this.graphHost, this.notice);
@@ -86,6 +82,12 @@ export class Explorer {
   }
 
   get isGraph(): boolean { return this.mode === "graph"; }
+
+  clearFilters(): void {
+    this.filter.query = ""; this.filter.status = "all"; this.filter.kind = "all";
+    this.search.value = ""; this.status.value = "all"; this.kind.value = "all";
+    this.events.change();
+  }
   private get filtering(): boolean { return this.filter.query.trim() !== "" || this.filter.status !== "all" || this.filter.kind !== "all"; }
 
   render(tree: Tree | null, selected: AgentId | null, now: number, skillsShown: boolean, message: string | null): Tree | null {

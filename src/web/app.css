@@ -345,8 +345,32 @@ code {
   padding: 14px 16px 4px;
 }
 
-.rail-names { display: flex; align-items: center; gap: 8px; }
+.rail-names { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .rail-title { font-size: 12.5px; font-weight: 650; }
+
+/* Which sessions the list holds: pstack only by default, or everything the harnesses recorded. */
+.rail-scope {
+  max-width: 150px;
+  padding: 4px 24px 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--layer);
+  color: var(--text-2);
+  font: inherit;
+  font-size: 11.5px;
+}
+.rail-scope:hover { color: var(--text); border-color: var(--line-strong); }
+
+.session-tag {
+  padding: 1px 6px;
+  border: 1px solid color-mix(in oklab, var(--accent) 35%, transparent);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
 
 .rail-group[hidden] { display: none; }
 
@@ -1733,6 +1757,17 @@ body[data-view="setup"] .rail-toggle { display: none; }
 .setting-table td:nth-child(2) { width: 30%; }
 .setting-how { color: var(--text-2); }
 .lane-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+
+/* The journal's lane list. */
+.table-scroll { overflow-x: auto; }
+.lane-table th { width: auto; white-space: nowrap; color: var(--text-3); font-size: 11.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+.lane-table td { white-space: nowrap; vertical-align: middle; }
+.lane-table td:first-child { white-space: normal; min-width: 180px; }
+.lane-name { font-weight: 550; }
+.lane-id { color: var(--text-3); font-size: 11px; }
+.lane-size { font-variant-numeric: tabular-nums; color: var(--text-2); }
+.lane-table tr[data-status="running"] .lane-name { color: var(--accent-strong); }
+.lane-table td:last-child { text-align: right; }
 .lane-chip {
   display: inline-flex;
   align-items: center;

@@ -1,7 +1,7 @@
-import type { AgentId, AgentNode, Harness, MessageLink, SourceKind } from "../domain.ts";
+import { SCOPES, type AgentId, type AgentNode, type Harness, type MessageLink, type Scope, type SourceKind } from "../domain.ts";
 import { compactNumber, shortPath, working } from "../format.ts";
 import { countsOf, isLive, rootOf, rootsOf, treeOf, withoutSkills } from "../graph.ts";
-import type { Delta, JournalResponse, PstackSetup, ServerInfo, Snapshot, SourceHealth, TimelineAppend, TimelinePage } from "../wire.ts";
+import type { Delta, JournalRequest, JournalResponse, JournalState, PstackSetup, ResetResponse, ServerInfo, Snapshot, SourceHealth, TimelineAppend, TimelinePage } from "../wire.ts";
 import { Canvas } from "./canvas.ts";
 import { Explorer } from "./explorer.ts";
 import { postJson } from "./commands.ts";
@@ -24,6 +24,39 @@ const RETRY_MS = 3_000;
 /** Canvas kept visible beside the panel; narrower than this and the panel overlays it. */
 const CANVAS_MIN = 360;
 const SKILLS_KEY = "psf-monitor.skills-shown";
+const SCOPE_KEY = "psf-monitor.scope";
+/** Every per-session card layout lives under this prefix; Reset all clears them together. */
+const OFFSET_PREFIX = "psf-monitor.offsets.";
+
+function isScope(value: unknown): value is Scope {
+  return typeof value === "string" && (SCOPES as readonly string[]).includes(value);
+}
+
+/** The link's `scope` wins for this opening; otherwise the last choice on this browser; otherwise pstack only. */
+function initialScope(fromLink: string | null): Scope {
+  if (isScope(fromLink)) return fromLink;
+  try {
+    const stored = localStorage.getItem(SCOPE_KEY);
+    if (isScope(stored)) return stored;
+  } catch { /* Storage is unavailable. */ }
+  return "pstack";
+}
+
+function storeScope(scope: Scope): void {
+  try { localStorage.setItem(SCOPE_KEY, scope); }
+  catch { /* The choice lasts for this page only. */ }
+}
+
+function clearStoredLayouts(): void {
+  try {
+    const keys: string[] = [];
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = localStorage.key(index);
+      if (key !== null && key.startsWith(OFFSET_PREFIX)) keys.push(key);
+    }
+    for (const key of keys) localStorage.removeItem(key);
+  } catch { /* Nothing stored. */ }
+}
 
 function storedSkillsShown(): boolean {
   try { return localStorage.getItem(SKILLS_KEY) !== "false"; }
@@ -49,8 +82,11 @@ interface State {
   connection: Connection;
   dismissed: string;
   view: View;
+  scope: Scope;
   setup: PstackSetup | null;
   setupError: string | null;
+  journal: JournalState | null;
+  journalError: string | null;
 }
 
 const params = new URLSearchParams(location.search);
@@ -67,8 +103,11 @@ const state: State = {
   connection: "connecting",
   dismissed: "",
   view: location.hash === SETUP_HASH ? "setup" : "sessions",
+  scope: initialScope(params.get("scope")),
   setup: null,
   setupError: null,
+  journal: null,
+  journalError: null,
 };
 
 let skillsShown = storedSkillsShown();
@@ -92,8 +131,8 @@ const panel = new Panel({
   loadOlder: (agent, before) => fetchTimeline(agent, before),
   resized: (width, settled) => setRightInset(insetFor(width), settled),
 });
-const rail = new Rail({ select: (root) => selectSession(root) });
-const setupView = new SetupView({ refresh: () => void fetchSetup() });
+const rail = new Rail({ select: (root) => selectSession(root), scope: (next) => setScope(next) });
+const setupView = new SetupView({ refresh: () => void fetchSetup(), journal: (request) => changeJournal(request) });
 
 const sessionTitle = h("h1", { class: "bar-title" });
 const sessionPath = h("span", { class: "bar-path mono" });
@@ -106,9 +145,10 @@ const banner = h("div", { class: "banner", attrs: { hidden: "", role: "note" } }
 const viewButton = h("button", { class: "quiet-action", attrs: { type: "button" } });
 viewButton.addEventListener("click", () => setView(state.view === "setup" ? "sessions" : "setup"));
 const journalButton = h("button", { class: "quiet-action", attrs: { type: "button" } });
+const resetButton = h("button", { class: "quiet-action", attrs: { type: "button" }, title: "Show hidden sessions again, clear filters, and put every card back" });
 const stopButton = h("button", { class: "quiet-action", attrs: { type: "button" } }, icon("stop"), h("span", { text: "Stop monitor" }));
 const controlMessage = h("span", { class: "bar-command-message", attrs: { role: "status", hidden: "" } });
-const barControls = h("div", { class: "bar-controls" }, viewButton, journalButton, stopButton, controlMessage);
+const barControls = h("div", { class: "bar-controls" }, viewButton, journalButton, resetButton, stopButton, controlMessage);
 
 const bar = h(
   "header",
@@ -123,8 +163,10 @@ const bar = h(
 
 let journalConfirmUntil = 0;
 let stopConfirmUntil = 0;
+let resetConfirmUntil = 0;
 let journalPending = false;
 let stopPending = false;
+let resetPending = false;
 
 function renderControls(): void {
   viewButton.replaceChildren(icon(state.view === "setup" ? "sessions" : "sliders"), h("span", { text: state.view === "setup" ? "Sessions" : "Setup" }));
@@ -134,8 +176,70 @@ function renderControls(): void {
   journalButton.replaceChildren(icon("lane"), h("span", { text: state.server === null ? "Journal…" : journalPending ? "Updating…" : journalArmed ? "Confirm: Delete recorded lanes?" : `Journal: ${journal ? "on" : "off"}` }));
   journalButton.title = journal ? "Turn off lane journal and delete its records" : "Turn on lane journal";
   journalButton.disabled = state.server === null || journalPending || state.connection === "stopped";
+  resetButton.replaceChildren(icon("reset"), h("span", { text: resetPending ? "Resetting…" : resetConfirmUntil > Date.now() ? "Confirm: Reset all?" : "Reset all" }));
+  resetButton.disabled = state.server === null || resetPending || state.connection === "stopped";
   stopButton.replaceChildren(icon("stop"), h("span", { text: stopPending ? "Stopping…" : stopConfirmUntil > Date.now() ? "Confirm: Stop monitor?" : "Stop monitor" }));
   stopButton.disabled = state.server === null || stopPending || state.connection === "stopped";
+}
+
+resetButton.addEventListener("click", () => {
+  if (resetConfirmUntil <= Date.now()) {
+    resetConfirmUntil = Date.now() + 4_000;
+    renderControls();
+    window.setTimeout(renderControls, 4_050);
+    return;
+  }
+  resetConfirmUntil = 0;
+  resetPending = true;
+  controlError("");
+  renderControls();
+  void (async () => {
+    try {
+      const { status, data } = await postJson<ResetResponse>("/api/reset", {});
+      if (status !== 200 || !data.ok) controlError(data.message);
+      else {
+        canvas.resetLayout();
+        clearStoredLayouts();
+        explorer.clearFilters();
+        controlError(data.message);
+        window.setTimeout(() => controlError(""), 4_000);
+        // The server re-sends anything it had hidden; a fresh snapshot is the simplest way to pick that up.
+        connect();
+      }
+    } catch {
+      controlError("Could not reach the monitor.");
+    }
+    resetPending = false;
+    renderControls();
+  })();
+});
+
+function setScope(next: Scope): void {
+  if (state.scope === next) return;
+  state.scope = next;
+  storeScope(next);
+  state.session = null;
+  if (state.agent !== null) {
+    state.agent = null;
+    panel.close();
+    setRightInset(0);
+  }
+  render();
+  connect();
+}
+
+async function changeJournal(request: JournalRequest): Promise<string | null> {
+  let error: string | null = null;
+  try {
+    const { status, data } = await postJson<JournalResponse>("/api/journal", request);
+    if (status !== 200 || !data.ok) error = data.message;
+    else if (state.server !== null) state.server = { ...state.server, journal: data.journal };
+  } catch {
+    error = "Could not reach the monitor.";
+  }
+  await fetchJournal();
+  render();
+  return error;
 }
 
 function controlError(message: string): void {
@@ -224,8 +328,9 @@ function connect(): void {
   source?.close();
   if (retryTimer !== null) window.clearTimeout(retryTimer);
   retryTimer = null;
-  const url = state.agent === null ? "/api/events" : `/api/events?watch=${encodeURIComponent(state.agent)}`;
-  const stream = new EventSource(url);
+  const query = new URLSearchParams({ scope: state.scope });
+  if (state.agent !== null) query.set("watch", state.agent);
+  const stream = new EventSource(`/api/events?${query.toString()}`);
   source = stream;
   stream.addEventListener("open", () => setConnection("live"));
   stream.addEventListener("snapshot", (event) => onSnapshot(JSON.parse((event as MessageEvent<string>).data) as Snapshot));
@@ -276,7 +381,19 @@ async function fetchSetup(): Promise<void> {
   } catch (error) {
     state.setupError = error instanceof TypeError ? "Could not reach the monitor." : error instanceof Error ? error.message : "Could not read the pstack setup.";
   }
+  await fetchJournal();
   render();
+}
+
+async function fetchJournal(): Promise<void> {
+  try {
+    const response = await fetch("/api/journal");
+    if (!response.ok) throw new Error("The monitor could not read the lane journal.");
+    state.journal = (await response.json()) as JournalState;
+    state.journalError = null;
+  } catch (error) {
+    state.journalError = error instanceof TypeError ? "Could not reach the monitor." : error instanceof Error ? error.message : "Could not read the lane journal.";
+  }
 }
 
 function setView(view: View): void {
@@ -310,6 +427,12 @@ function onDelta(delta: Delta): void {
       pulses.push(node.id);
     }
     state.nodes.set(node.id, node);
+  }
+  for (const id of delta.removals) state.nodes.delete(id);
+  if (state.agent !== null && !state.nodes.has(state.agent)) {
+    state.agent = null;
+    panel.close();
+    setRightInset(0);
   }
   const talks: MessageLink[] = [];
   if (delta.links !== null) {
@@ -416,13 +539,16 @@ function render(): void {
     descendants.set(root, { total: entry.total + (node.flavor.kind === "skill" ? 0 : 1), skills: entry.skills + (node.flavor.kind === "skill" ? 1 : 0), running: entry.running + (node.flavor.kind !== "skill" && working(node, now) ? 1 : 0) });
   }
   const hours = state.server?.windowHours ?? 24;
-  rail.render(roots, descendants, state.session, now, `All projects · Last ${hours} hours`);
+  rail.render(roots, descendants, state.session, now, `All projects · Last ${hours} hours`, state.scope);
 
   const tree = state.session === null ? null : treeOf(state.session, shown);
   const fullTree = state.session === null ? null : treeOf(state.session, all);
   const message = state.connection === "stopped" ? "Monitor stopped. Run psf-monitor start to start it again."
     : state.connection === "expired" ? "Link expired. Run psf-monitor start and open the new link."
-    : all.size === 0 ? state.server?.indexing === true ? "Reading recent transcripts…" : `No pstack sessions in the last ${hours} hours. Run a pstack skill in Claude Code or Codex to begin.`
+    : all.size === 0 ? state.server?.indexing === true ? "Reading recent transcripts…"
+      : state.scope === "pstack" ? `No pstack sessions in the last ${hours} hours. Run a pstack skill in Claude Code or Codex to begin, or switch the list to all sessions.`
+      : state.scope === "normal" ? `No sessions without pstack in the last ${hours} hours.`
+      : `No sessions in the last ${hours} hours.`
     : null;
   const filtered = explorer.render(tree, state.agent, now, skillsShown, message);
   if (explorer.isGraph) canvas.render(filtered, state.agent, now, state.links);
@@ -431,7 +557,7 @@ function render(): void {
   canvas.setEmpty(null);
 
   if (state.view === "setup") {
-    setupView.render({ setup: state.setup, error: state.setupError, nodes: all, server: state.server, now });
+    setupView.render({ setup: state.setup, error: state.setupError, journal: state.journal, journalError: state.journalError, nodes: all, server: state.server, now });
     sessionTitle.textContent = "pstack setup";
     sessionPath.textContent = "";
     stats.replaceChildren();

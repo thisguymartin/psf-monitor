@@ -1,24 +1,44 @@
 import type { AgentId, AgentNode, Harness } from "../domain.ts";
 import { ago, compactNumber, working } from "../format.ts";
-import type { ModelSheet, ProviderSetup, PstackSetup, ServerInfo, SheetRole, SkillInfo } from "../wire.ts";
+import type { JournalRequest, JournalState, LaneSummary, ModelSheet, ProviderSetup, PstackSetup, ServerInfo, SheetRole, SkillInfo } from "../wire.ts";
 import { h, icon, providerIcon } from "./dom.ts";
 
 // The setup view: what pstack has installed, which providers can run a lane,
-// which model each role uses, and how to change each of those.
+// which model each role uses, what the lane journal holds, and how to change each of those.
 
 const SETUP_COMMAND = "/pstack:setup-pstack";
 const HARNESS_NAME: Record<Harness, string> = { claude: "Claude Code", codex: "Codex", opencode: "OpenCode" };
 
 export interface SetupEvents {
   refresh(): void;
+  /** Changes the lane journal; resolves to an error message, or null when the change went through. */
+  journal(request: JournalRequest): Promise<string | null>;
 }
 
 export interface SetupInput {
   readonly setup: PstackSetup | null;
   readonly error: string | null;
+  readonly journal: JournalState | null;
+  readonly journalError: string | null;
   readonly nodes: ReadonlyMap<AgentId, AgentNode>;
   readonly server: ServerInfo | null;
   readonly now: number;
+}
+
+function bytesText(bytes: number): string {
+  if (bytes >= 1_048_576) return `${(bytes / 1_048_576).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${bytes} B`;
+}
+
+function laneState(lane: LaneSummary): "ok" | "warn" | "quiet" | "live" {
+  switch (lane.status) {
+    case "complete": return "ok";
+    case "running": return "live";
+    case "cancelled":
+    case "unknown": return "quiet";
+    default: return "warn";
+  }
 }
 
 interface Usage {
@@ -133,6 +153,10 @@ export class SetupView {
   private sort: SkillSort = "name";
   private last: SetupInput | null = null;
   private drawn = "";
+  /** Journal buttons that asked for a second click, by action key, until when. */
+  private readonly armed = new Map<string, number>();
+  private busy: string | null = null;
+  private journalMessage: string | null = null;
 
   constructor(private readonly events: SetupEvents) {
     this.element = h("section", { class: "setup", attrs: { hidden: "", "aria-label": "pstack setup" } }, this.body);
@@ -152,7 +176,7 @@ export class SetupView {
     const usage = usageOf(input.nodes, input.now);
     // Rebuild only when something shown changed, so a filter being typed keeps its focus and scroll.
     // The minute keeps "2m ago" honest.
-    const signature = JSON.stringify([input.setup, input.error, input.server?.journal, input.server?.windowHours, [...usage.skills], [...usage.providers], Math.floor(input.now / 60_000)]);
+    const signature = JSON.stringify([input.setup, input.error, input.journal, input.journalError, this.busy, this.journalMessage, [...this.armed], input.server?.journal, input.server?.windowHours, [...usage.skills], [...usage.providers], Math.floor(input.now / 60_000)]);
     if (signature === this.drawn) return;
     this.drawn = signature;
 
@@ -169,6 +193,7 @@ export class SetupView {
       this.providers(setup, usage.providers, input),
       this.roles(setup),
       this.skillsSection(),
+      this.journalSection(input),
       this.settings(setup, input),
     );
     this.drawSkills(setup, usage.skills, input.now);
@@ -392,6 +417,85 @@ export class SetupView {
     );
   }
 
+  // --- journal -----------------------------------------------------------------
+
+  /** A button that asks once more before doing something that deletes records. */
+  private journalButton(key: string, label: string, confirm: string | null, request: JournalRequest, disabled = false, title = ""): HTMLButtonElement {
+    const armed = (this.armed.get(key) ?? 0) > Date.now();
+    const button = h("button", { class: "quiet-action", text: this.busy === key ? "Working…" : armed ? `Confirm: ${confirm}` : label, attrs: { type: "button" }, title });
+    button.disabled = disabled || this.busy !== null;
+    button.addEventListener("click", () => {
+      if (confirm !== null && (this.armed.get(key) ?? 0) <= Date.now()) {
+        this.armed.set(key, Date.now() + 4_000);
+        this.rerender();
+        window.setTimeout(() => this.rerender(), 4_050);
+        return;
+      }
+      this.armed.delete(key);
+      this.busy = key;
+      this.journalMessage = null;
+      this.rerender();
+      void this.events.journal(request).then((error) => {
+        this.busy = null;
+        this.journalMessage = error;
+        this.rerender();
+      });
+    });
+    return button;
+  }
+
+  private rerender(): void {
+    if (this.last !== null) this.render(this.last);
+  }
+
+  private journalSection(input: SetupInput): HTMLElement {
+    const journal = input.journal;
+    const on = journal?.on ?? input.server?.journal ?? false;
+    const lanes = journal?.lanes ?? [];
+    const running = lanes.filter((lane) => lane.status === "running").length;
+    const idle = lanes.length - running;
+    const total = lanes.reduce((sum, lane) => sum + lane.bytes, 0);
+    const rows = lanes.map((lane) => {
+      const live = lane.status === "running";
+      const model = [lane.provider, lane.model].filter((part) => part !== null).join(":") + (lane.effort === null ? "" : `@${lane.effort}`);
+      return h("tr", { attrs: { "data-status": lane.status } },
+        h("td", {}, h("div", { class: "lane-name", text: lane.label ?? "unlabeled lane" }), h("div", { class: "mono lane-id", text: lane.laneId })),
+        h("td", { class: "mono", text: model.length > 0 ? model : "?" }),
+        h("td", { text: lane.parent === null ? "" : HARNESS_NAME[lane.parent as Harness] ?? lane.parent }),
+        h("td", {}, chip(lane.status.replace(/-/g, " "), laneState(lane))),
+        h("td", { text: ago(lane.startedAt, input.now), title: lane.startedAt ?? "" }),
+        h("td", { class: "lane-size", text: bytesText(lane.bytes) }),
+        h("td", {}, this.journalButton(`delete:${lane.laneId}`, "Delete", "Delete this lane's records?", { delete: lane.laneId }, live, live ? "Cancel the lane first." : "")),
+      );
+    });
+    const summary = !on ? "Off: external lanes are not recorded, and lanes from before were deleted."
+      : lanes.length === 0 ? "On, with nothing recorded yet. Lanes appear here as pstack runs them."
+      : `${plural(lanes.length, "lane")} · ${bytesText(total)}${running > 0 ? ` · ${running} running` : ""}`;
+    return h(
+      "section",
+      { class: "setup-section" },
+      h("div", { class: "setup-title" },
+        h("h3", { text: "Journal" }),
+        chip(on ? "on" : "off", on ? "ok" : "quiet"),
+        h("span", { class: "rail-count", text: summary }),
+        h("div", { class: "setup-tools" },
+          on ? this.journalButton("clear", "Clear all", idle > 0 ? `Delete ${plural(idle, "recorded lane")}?` : null, { clear: true }, idle === 0, idle === 0 ? "Nothing to delete." : "") : null,
+          this.journalButton("toggle", on ? "Turn off" : "Turn on", on ? "Turn off and delete every recorded lane?" : null, { on: !on }),
+          this.refreshButton("Refresh"),
+        ),
+      ),
+      input.journalError !== null ? h("p", { class: "setup-note", attrs: { role: "alert" }, text: input.journalError }) : null,
+      this.journalMessage !== null ? h("p", { class: "setup-note", attrs: { role: "alert" }, text: this.journalMessage }) : null,
+      rows.length > 0 ? h("div", { class: "table-scroll" }, h("table", { class: "role-table lane-table" },
+        h("thead", {}, h("tr", {}, ...["Lane", "Model", "From", "Status", "Started", "Size", ""].map((text) => h("th", { text, attrs: { scope: "col" } })))),
+        h("tbody", {}, ...rows))) : null,
+      h("p", { class: "setup-note" },
+        journal === null ? "" : h("span", {}, "Records live in ", h("span", { class: "mono", text: journal.root }), ". "),
+        "The server prunes lanes older than 7 days. The same list prints with ", h("code", { text: "psf-monitor journal list" }),
+        "; ", h("code", { text: "journal rm <lane id>" }), " and ", h("code", { text: "journal clear" }), " delete from a terminal."),
+    );
+  }
+
   // --- settings ----------------------------------------------------------------
 
   private settings(setup: PstackSetup, input: SetupInput): HTMLElement {
@@ -402,8 +506,8 @@ export class SetupView {
     };
     if (server !== null) {
       row("Lane journal", chip(server.journal ? "on" : "off", server.journal ? "ok" : "quiet"), server.journal
-        ? "Records external lanes and keeps them 7 days. The Journal button in the top bar turns it off and deletes them."
-        : "Off: external lanes will not appear. Turn it on with the Journal button in the top bar.");
+        ? "Records external lanes and keeps them 7 days. The Journal section above lists, deletes, and turns them off."
+        : "Off: external lanes will not appear. Turn it on in the Journal section above.");
       row("Window", `last ${server.windowHours} hours`, h("code", { text: "psf-monitor start --hours <n>" }));
       row("Address", h("span", { class: "mono", text: location.host }), h("code", { text: "psf-monitor start --port <n>" }));
       row("Monitor", h("span", { class: "mono", text: server.version }), `pid ${server.pid} · started ${ago(server.startedAt, input.now)} · watching by ${server.watching === "events" ? "file events" : "polling"}`);
