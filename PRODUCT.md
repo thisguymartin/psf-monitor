@@ -16,7 +16,7 @@ The default session view is a nested, expandable list, confirmed by the user. St
 
 ## Constraints
 
-Use the existing Bun and TypeScript application and harness-specific themes. Preserve session selection, setup, journal controls, and monitor controls. Bind only to loopback; preserve per-start authentication and same-origin state changes. Transcript-format knowledge belongs in adapters.
+Use the existing Bun and TypeScript application and harness-specific themes. Preserve session selection, session scope (pstack, other, all), hiding and reset, setup, journal controls, and monitor controls. Bind only to loopback; preserve per-start authentication and same-origin state changes. Transcript-format knowledge belongs in adapters.
 
 ## Evidence
 
