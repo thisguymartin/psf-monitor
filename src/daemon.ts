@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import type { AgentNode, Harness } from "./domain.ts";
 import { cancelLane } from "./control.ts";
 import { diskFileSystem } from "./fs.ts";
+import { HiddenSessions } from "./hidden.ts";
 import { lockInstance } from "./instance-lock.ts";
 import { journalOn, pruneLanes } from "./journal.ts";
 import { Monitor } from "./monitor.ts";
@@ -137,6 +138,7 @@ async function serveLocked(where: Homes, options: ServeOptions, io: Io): Promise
   const version = monitorVersion();
   const instance = randomBytes(8).toString("hex");
   const token = randomBytes(24).toString("base64url");
+  const hidden = new HiddenSessions(where.state);
   const monitor = new Monitor({
     adapters: adapters(where),
     fs: diskFileSystem,
@@ -145,6 +147,7 @@ async function serveLocked(where: Homes, options: ServeOptions, io: Io): Promise
     version,
     instance,
     lanes: where.lanes,
+    hidden,
   });
   let resolveStopped: () => void = () => {};
   const stopped = new Promise<void>((resolve) => { resolveStopped = resolve; });
@@ -164,6 +167,7 @@ async function serveLocked(where: Homes, options: ServeOptions, io: Io): Promise
     server = Bun.serve({ hostname: "127.0.0.1", port: options.port, fetch: (request, bun) => handler(request, bun) });
   } catch (error) {
     inbox.close();
+    hidden.close();
     io.stderr(`port ${options.port} is unavailable: ${error instanceof Error ? error.message : String(error)}\n`);
     return 69;
   }
@@ -185,6 +189,7 @@ async function serveLocked(where: Homes, options: ServeOptions, io: Io): Promise
   } finally {
     monitor.stop();
     inbox.close();
+    hidden.close();
     server.stop(true);
     clearRecord(where.state, instance);
     process.removeListener("SIGTERM", resolveStopped);

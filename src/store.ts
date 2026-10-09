@@ -10,6 +10,7 @@ import type {
   PendingCall,
   Prompt,
   Result,
+  Scope,
   SourceKind,
   SpawnVia,
 } from "./domain.ts";
@@ -76,6 +77,8 @@ export interface ProbeTarget {
 export interface Flush {
   readonly rev: number;
   readonly upserts: readonly AgentNode[];
+  /** Agents that left the page: hidden trees and forgotten lanes. */
+  readonly removals: readonly AgentId[];
   /** Every message link, sent whole whenever any of them changed; null when none did. */
   readonly links: readonly MessageLink[] | null;
 }
@@ -273,12 +276,109 @@ export class Store implements StatusView {
   private readonly statusCache = new Map<AgentId, AgentStatus>();
   private readonly messages = new Map<string, Message>();
   private pstackRoots: Set<AgentId> | null = null;
+  /** Tree roots the user hid, with when; a tree active after that time comes back on its own. */
+  private readonly hidden = new Map<AgentId, number>();
+  private treeActivity: Map<AgentId, number> | null = null;
+  private readonly pendingRemovals = new Set<AgentId>();
   private sentLinks = "[]";
   private dirty = false;
   private revision = 0;
 
+  /** Told when a hidden tree became active again, so the hide can be dropped wherever it was kept. */
+  onUnhide: (root: AgentId) => void = () => {};
+
   get rev(): number {
     return this.revision;
+  }
+
+  /** Replaces the hide list, as read from disk at startup. */
+  setHidden(entries: ReadonlyMap<AgentId, number>): void {
+    this.hidden.clear();
+    for (const [root, at] of entries) this.hidden.set(root, at);
+    this.changed();
+  }
+
+  /** Hides the tree under `id` until any agent in it is active after `at`. */
+  hide(id: AgentId, at: number): AgentId | null {
+    if (!this.agents.has(id)) return null;
+    const root = this.treeRoot(id);
+    this.hidden.set(root, at);
+    for (const member of this.treeIds(root)) {
+      this.sent.delete(member);
+      this.pendingRemovals.add(member);
+    }
+    this.changed();
+    return root;
+  }
+
+  clearHidden(): number {
+    const count = this.hidden.size;
+    for (const root of this.hidden.keys()) for (const member of this.treeIds(root)) this.sent.delete(member);
+    this.hidden.clear();
+    this.changed();
+    return count;
+  }
+
+  hiddenRoots(): AgentId[] {
+    this.refreshHidden();
+    return [...this.hidden.keys()];
+  }
+
+  /** Drops agents the monitor should no longer know about, such as a deleted lane. */
+  forget(ids: readonly AgentId[]): void {
+    for (const id of ids) {
+      if (!this.agents.delete(id)) continue;
+      const key = this.processByAgent.get(id);
+      if (key !== undefined) this.retractProcess(key);
+      this.currentSkills.delete(id);
+      this.sent.delete(id);
+      this.pendingRemovals.add(id);
+    }
+    this.changed();
+  }
+
+  inScope(id: AgentId, scope: Scope): boolean {
+    if (!this.agents.has(id)) return false;
+    switch (scope) {
+      case "all": return true;
+      case "pstack": return this.isPstack(id);
+      case "normal": return !this.isPstack(id);
+    }
+  }
+
+  isHidden(id: AgentId): boolean {
+    this.refreshHidden();
+    return this.hidden.has(this.treeRoot(id));
+  }
+
+  private treeIds(root: AgentId): AgentId[] {
+    const ids: AgentId[] = [];
+    for (const id of this.agents.keys()) if (this.treeRoot(id) === root) ids.push(id);
+    return ids;
+  }
+
+  private latestActivity(root: AgentId): number {
+    if (this.treeActivity === null) {
+      this.treeActivity = new Map();
+      for (const agent of this.agents.values()) {
+        const at = agent.lastActivityAt === null ? Number.NaN : Date.parse(agent.lastActivityAt);
+        if (!Number.isFinite(at)) continue;
+        const top = this.treeRoot(agent.id);
+        this.treeActivity.set(top, Math.max(this.treeActivity.get(top) ?? Number.NEGATIVE_INFINITY, at));
+      }
+    }
+    return this.treeActivity.get(root) ?? Number.NEGATIVE_INFINITY;
+  }
+
+  /** A hidden tree that was active after it was hidden is shown again. */
+  private refreshHidden(): void {
+    for (const [root, at] of this.hidden) {
+      if (this.latestActivity(root) <= at) continue;
+      this.hidden.delete(root);
+      for (const member of this.treeIds(root)) this.sent.delete(member);
+      this.dirty = true;
+      this.onUnhide(root);
+    }
   }
 
   apply(fact: Fact): void {
@@ -428,7 +528,7 @@ export class Store implements StatusView {
 
   resultPath(id: AgentId): string | null {
     const node = this.agents.get(id);
-    return node?.flavor.kind === "lane" && this.isPstack(id) ? node.resultPath : null;
+    return node?.flavor.kind === "lane" ? node.resultPath : null;
   }
 
   /** True when the agent's session root has a live process, so its files stay indexed. */
@@ -538,7 +638,7 @@ export class Store implements StatusView {
   }
 
   /** Messages summed per sender and recipient. A message whose ends are not both indexed is left out. */
-  links(): MessageLink[] {
+  links(scope: Scope = "pstack"): MessageLink[] {
     const codexPaths = new Map<string, AgentId>();
     for (const agent of this.agents.values()) {
       if (agent.agentPath !== null) codexPaths.set(`${this.treeRoot(agent.id)}|${agent.agentPath}`, agent.id);
@@ -547,7 +647,7 @@ export class Store implements StatusView {
     for (const message of this.messages.values()) {
       const from = this.resolve(message.from, codexPaths);
       const to = this.resolve(message.to, codexPaths);
-      if (from === null || to === null || from === to || !this.isPstack(from) || !this.isPstack(to)) continue;
+      if (from === null || to === null || from === to || !this.inScope(from, scope) || !this.inScope(to, scope) || this.isHidden(from) || this.isHidden(to)) continue;
       const key = `${from}>${to}`;
       const pair = pairs.get(key) ?? { from, to, count: 0, lastAt: null };
       pair.count += 1;
@@ -568,6 +668,7 @@ export class Store implements StatusView {
       harness: agent.harness,
       source: agent.source,
       flavor: agent.flavor,
+      pstack: this.isPstack(id),
       title: agent.title ?? agent.titleHint ?? defaultTitle(agent),
       cwd: agent.cwd,
       model: {
@@ -598,40 +699,48 @@ export class Store implements StatusView {
     return this.pstackRoots.has(this.treeRoot(id));
   }
 
-  nodes(): AgentNode[] {
+  /** The agents a page with this scope shows: in scope and not hidden. */
+  nodes(scope: Scope = "pstack"): AgentNode[] {
     const result: AgentNode[] = [];
     for (const id of this.agents.keys()) {
-      if (!this.isPstack(id)) continue;
+      if (!this.inScope(id, scope) || this.isHidden(id)) continue;
       const node = this.node(id);
       if (node !== null) result.push(node);
     }
     return result;
   }
 
-  /** Nodes whose serialized form changed since the last flush, and the links if any changed. */
+  /**
+   * Nodes whose serialized form changed since the last flush, across every scope,
+   * with the agents that left and the links if any changed. Callers filter by scope.
+   */
   flush(): Flush | null {
+    this.refreshHidden();
     if (!this.dirty) return null;
     this.dirty = false;
     const upserts: AgentNode[] = [];
-    for (const node of this.nodes()) {
+    for (const node of this.nodes("all")) {
       const serialized = JSON.stringify(node);
       if (this.sent.get(node.id) === serialized) continue;
       this.sent.set(node.id, serialized);
       upserts.push(node);
     }
-    const links = this.links();
+    const removals = [...this.pendingRemovals].filter((id) => !this.agents.has(id) || this.isHidden(id));
+    this.pendingRemovals.clear();
+    const links = this.links("all");
     const serializedLinks = JSON.stringify(links);
     const linksChanged = serializedLinks !== this.sentLinks;
     this.sentLinks = serializedLinks;
-    if (upserts.length === 0 && !linksChanged) return null;
+    if (upserts.length === 0 && removals.length === 0 && !linksChanged) return null;
     this.revision += 1;
-    return { rev: this.revision, upserts, links: linksChanged ? links : null };
+    return { rev: this.revision, upserts, removals, links: linksChanged ? links : null };
   }
 
   private changed(): void {
     this.dirty = true;
     this.statusCache.clear();
     this.pstackRoots = null;
+    this.treeActivity = null;
     this.laneMatches = null;
   }
 

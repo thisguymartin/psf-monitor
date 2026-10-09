@@ -15,7 +15,6 @@ export async function cancelLane(
   id: AgentId,
   kill: (pid: number, signal: NodeJS.Signals) => void = (pid, signal) => process.kill(pid, signal),
 ): Promise<CancelResult> {
-  if (!store.isPstack(id)) return { kind: "unknown-agent" };
   const node = store.node(id);
   if (node === null) return { kind: "unknown-agent" };
   if (!agentAction("cancel").available(node)) return { kind: "not-cancellable", reason: "Lane is not running." };

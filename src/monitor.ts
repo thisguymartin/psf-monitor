@@ -1,10 +1,12 @@
 import { watch, type FSWatcher } from "node:fs";
 import { join } from "node:path";
 import type { Adapter } from "./adapter.ts";
-import type { AgentId, TimelineItem } from "./domain.ts";
+import type { AgentId, Scope, TimelineItem } from "./domain.ts";
 import type { FileSystem } from "./fs.ts";
+import type { HiddenSessions } from "./hidden.ts";
 import { Index } from "./index.ts";
 import { journalEnabled } from "./journal.ts";
+import { laneId } from "./adapters/lane.ts";
 import { alive, type ProcessTable } from "./probe.ts";
 import { Store } from "./store.ts";
 import type { ServerEvent, ServerInfo, Snapshot, SourceHealth, TimelinePage } from "./wire.ts";
@@ -20,6 +22,7 @@ const HINT_DELAY_MS = 75;
 export const FIRST_PAGE = 80;
 
 export interface Subscriber {
+  readonly scope: Scope;
   readonly watch: AgentId | null;
   send(event: ServerEvent): void;
   ping(): void;
@@ -33,6 +36,8 @@ export interface MonitorOptions {
   readonly version: string;
   readonly instance: string;
   readonly lanes: string;
+  /** Where hidden sessions are kept between runs; absent in tests that need none. */
+  readonly hidden?: HiddenSessions;
   readonly now?: () => number;
 }
 
@@ -53,6 +58,10 @@ export class Monitor {
     const now = options.now ?? Date.now;
     this.startedAt = new Date(now()).toISOString();
     this.lastJournal = journalEnabled(options.lanes);
+    if (options.hidden !== undefined) {
+      this.store.setHidden(options.hidden.all());
+      this.store.onUnhide = (root) => options.hidden?.unhide(root);
+    }
     this.index = new Index(options.adapters, this.store, options.fs, {
       sinceMs: now() - options.windowHours * 3_600_000,
       watched: (agent) => this.isWatched(agent),
@@ -75,11 +84,11 @@ export class Monitor {
     };
   }
 
-  snapshot(): Snapshot {
+  snapshot(scope: Scope = "pstack"): Snapshot {
     return {
       rev: this.store.rev,
-      agents: this.store.nodes(),
-      links: this.store.links(),
+      agents: this.store.nodes(scope),
+      links: this.store.links(scope),
       health: this.index.health(),
       server: this.info(),
     };
@@ -90,14 +99,42 @@ export class Monitor {
   }
 
   timeline(agent: AgentId, before: number | null, limit: number): TimelinePage | null {
-    if (!this.store.isPstack(agent)) return null;
     const node = this.store.node(agent);
-    if (node?.flavor.kind === "skill") return { agent, items: [], older: null };
+    if (node === null) return null;
+    if (node.flavor.kind === "skill") return { agent, items: [], older: null };
     return this.index.timeline(agent, before, limit);
   }
 
   resultPath(agent: AgentId): string | null {
     return this.store.resultPath(agent);
+  }
+
+  /** Hides the tree an agent belongs to until it is active again. Returns the hidden root. */
+  hide(agent: AgentId): AgentId | null {
+    const at = (this.options.now ?? Date.now)();
+    const root = this.store.hide(agent, at);
+    if (root !== null) this.options.hidden?.hide(root, at);
+    this.flush();
+    return root;
+  }
+
+  /** Shows every hidden session again. Returns how many were hidden. */
+  resetHidden(): number {
+    const count = this.store.clearHidden();
+    this.options.hidden?.clear();
+    this.flush();
+    return count;
+  }
+
+  /** Drops a lane whose journal directory is gone. */
+  forgetLane(lane: string): void {
+    this.store.forget([laneId(lane)]);
+    this.flush();
+  }
+
+  /** True while a live runner owns the lane, so its journal must stay. */
+  laneRunning(lane: string): boolean {
+    return this.store.isLive(laneId(lane));
   }
 
   /** Indexes the window, probes processes once, then keeps everything current. */
@@ -124,7 +161,7 @@ export class Monitor {
 
   subscribe(subscriber: Subscriber): () => void {
     this.subscribers.add(subscriber);
-    subscriber.send({ event: "snapshot", data: this.snapshot() });
+    subscriber.send({ event: "snapshot", data: this.snapshot(subscriber.scope) });
     if (subscriber.watch !== null) {
       const page = this.timeline(subscriber.watch, null, FIRST_PAGE);
       if (page !== null) subscriber.send({ event: "timeline", data: page });
@@ -156,27 +193,27 @@ export class Monitor {
     const journalChanged = journal !== this.lastJournal;
     this.lastJournal = journal;
     if (changes === null && !healthChanged && !journalChanged) return;
-    this.broadcast({
-      event: "delta",
-      data: {
-        rev: changes?.rev ?? this.store.rev,
-        upserts: changes?.upserts ?? [],
-        links: changes?.links ?? null,
-        health: healthChanged ? health : null,
-        indexing: this.index.isIndexing,
-        journal,
-      },
-    });
+    // Each page sees only the scope it asked for; removals are harmless to a page that never had the agent.
+    for (const subscriber of [...this.subscribers]) {
+      this.deliver(subscriber, {
+        event: "delta",
+        data: {
+          rev: changes?.rev ?? this.store.rev,
+          upserts: changes?.upserts.filter((node) => this.store.inScope(node.id, subscriber.scope)) ?? [],
+          removals: changes?.removals ?? [],
+          links: changes?.links === null || changes?.links === undefined ? null : this.store.links(subscriber.scope),
+          health: healthChanged ? health : null,
+          indexing: this.index.isIndexing,
+          journal,
+        },
+      });
+    }
   }
 
   private append(agent: AgentId, items: readonly TimelineItem[]): void {
     for (const subscriber of this.subscribers) {
-      if (subscriber.watch === agent && this.store.isPstack(agent)) this.deliver(subscriber, { event: "append", data: { agent, items } });
+      if (subscriber.watch === agent && this.store.has(agent)) this.deliver(subscriber, { event: "append", data: { agent, items } });
     }
-  }
-
-  private broadcast(event: ServerEvent): void {
-    for (const subscriber of this.subscribers) this.deliver(subscriber, event);
   }
 
   private heartbeat(): void {
@@ -198,7 +235,7 @@ export class Monitor {
   }
 
   private isWatched(agent: AgentId): boolean {
-    for (const subscriber of this.subscribers) if (subscriber.watch === agent && this.store.isPstack(agent)) return true;
+    for (const subscriber of this.subscribers) if (subscriber.watch === agent && this.store.has(agent)) return true;
     return false;
   }
 

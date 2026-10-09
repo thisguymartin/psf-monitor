@@ -8,7 +8,7 @@ const all: AgentFilter = { query: "", status: "all", kind: "all" };
 function node(id: string, parent: string | null, status: AgentNode["status"] = { kind: "done", at: null }): AgentNode {
   return {
     id: id as AgentId, parent: parent as AgentId | null, title: id, status,
-    via: null, spawnCall: null, harness: "codex", source: "codex-rollout",
+    via: null, spawnCall: null, harness: "codex", source: "codex-rollout", pstack: true,
     flavor: { kind: "subagent", agentType: null }, cwd: null,
     model: { provider: "codex", requested: "gpt-6", reported: null, effort: null },
     startedAt: null, lastActivityAt: "2026-10-05T11:00:00Z", activity: null,
