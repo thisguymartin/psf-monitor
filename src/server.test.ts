@@ -154,12 +154,27 @@ describe("data", () => {
     expect((await handle(request(`/api/result?agent=${encodeURIComponent(lane)}`, authed))).status).toBe(404);
   });
   it("serves the pstack setup behind the token", async () => {
-    const setup = { installs: [], skills: [], providers: [], sheets: [], defaults: [], settings: [], platform: "darwin" };
+    const setup = { installs: [], skills: [], providers: [], sheets: [], projects: [], defaults: [], settings: [], platform: "darwin" };
     const withSetup = createHandler(monitor, { port: PORT, token: TOKEN, assets: { html: "", css: "", js: "" }, lanes: join(scratch, "lanes"), cancel: async () => ({ kind: "unknown-agent" }), stop: () => {}, setup: () => setup });
     expect((await withSetup(request("/api/setup"))).status).toBe(401);
     expect(await (await withSetup(request("/api/setup", authed))).json()).toEqual(setup);
     expect((await withSetup(post("/api/setup", {}))).status).toBe(405);
     expect((await handle(request("/api/setup", authed))).status).toBe(404);
+  });
+
+  it("writes model sheets only through the sheet hook and bounds the request", async () => {
+    const seen: unknown[] = [];
+    const withSheet = createHandler(monitor, { port: PORT, token: TOKEN, assets: { html: "", css: "", js: "" }, lanes: join(scratch, "lanes"), cancel: async () => ({ kind: "unknown-agent" }), stop: () => {}, sheet: (request) => { seen.push(request); return { ok: true, message: "ok", path: "/p", errors: [], warnings: [] }; } });
+    const body = { harness: "claude", scope: "project", root: "/repo", roles: [{ role: "bug-fix", lanes: [" codex:gpt-6.1-sol@high "] }], confirmDiversity: true };
+    expect((await withSheet(post("/api/sheet", body))).status).toBe(200);
+    expect(seen[0]).toEqual({ harness: "claude", scope: "project", root: "/repo", roles: [{ role: "bug-fix", lanes: ["codex:gpt-6.1-sol@high"] }], confirmDiversity: true });
+    expect((await withSheet(post("/api/sheet", { ...body, harness: "cursor" }))).status).toBe(400);
+    expect((await withSheet(post("/api/sheet", { ...body, roles: [{ role: "x", lanes: [1] }] }))).status).toBe(400);
+    expect((await withSheet(post("/api/sheet", { ...body, roles: null }))).status).toBe(200);
+    expect((await withSheet(request("/api/sheet", authed))).status).toBe(405);
+    expect((await handle(post("/api/sheet", body))).status).toBe(404);
+    const refusing = createHandler(monitor, { port: PORT, token: TOKEN, assets: { html: "", css: "", js: "" }, lanes: join(scratch, "lanes"), cancel: async () => ({ kind: "unknown-agent" }), stop: () => {}, sheet: () => ({ ok: false, message: "bad", path: null, errors: ["bad"], warnings: [] }) });
+    expect((await refusing(post("/api/sheet", body))).status).toBe(422);
   });
 
   it("serves the snapshot for the requested scope, pstack by default", async () => {
@@ -270,7 +285,7 @@ describe("commands", () => {
     expect((await handler(post("/api/action", body, { host: "evil.example" }))).status).toBe(403);
     expect((await handler(post("/api/action", body, { "content-type": "" }))).status).toBe(400);
     expect((await handler(post("/api/action", body, { "content-type": "text/plain" }))).status).toBe(400);
-    expect((await handler(post("/api/action", { ...body, padding: "x".repeat(4_100) }))).status).toBe(400);
+    expect((await handler(post("/api/action", { ...body, padding: "x".repeat(33_000) }))).status).toBe(400);
     expect((await handler(new Request(`http://127.0.0.1:${PORT}/api/action`, { method: "POST", headers: { host: `127.0.0.1:${PORT}`, origin: `http://127.0.0.1:${PORT}`, ...authed, "content-type": "application/json" }, body: "{" }))).status).toBe(400);
     expect((await handler(post("/api/action", { agent: "lane:l1", action: "copy-resume" }))).status).toBe(400);
     expect(calls).toBe(0);

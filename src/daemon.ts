@@ -16,6 +16,7 @@ import { psTable } from "./probe.ts";
 import { clearRecord, readRecord, serverUrl, writeRecord, type ServerRecord } from "./record.ts";
 import { createHandler, type Assets } from "./server.ts";
 import { readSetup } from "./setup.ts";
+import { applySheetRequest } from "./sheets.ts";
 import { adapters, type Homes } from "./sources.ts";
 import { monitorVersion } from "./version.ts";
 import type { Snapshot } from "./wire.ts";
@@ -94,8 +95,8 @@ function logTail(path: string): string {
 }
 
 /** The setup as this process sees it: its own environment and PATH. */
-export function diskSetup(where: Homes) {
-  return readSetup({ where, fs: diskFileSystem, env: process.env, which: (command) => Bun.which(command), home: homedir(), platform: process.platform });
+export function diskSetup(where: Homes, cwds: readonly string[] = []) {
+  return readSetup({ where, fs: diskFileSystem, env: process.env, which: (command) => Bun.which(command), home: homedir(), platform: process.platform, cwds });
 }
 
 async function runningRecord(where: Homes): Promise<ServerRecord | null> {
@@ -159,7 +160,8 @@ async function serveLocked(where: Homes, options: ServeOptions, io: Io): Promise
     assets: await options.assets(),
     lanes: where.lanes,
     cancel: (id) => cancelLane(monitor.store, psTable, id),
-    setup: () => diskSetup(where),
+    setup: () => diskSetup(where, monitor.store.cwds()),
+    sheet: (request) => applySheetRequest(request, diskSetup(where, monitor.store.cwds())),
     stop: resolveStopped,
   });
   let server: ReturnType<typeof Bun.serve>;

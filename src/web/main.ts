@@ -1,7 +1,7 @@
 import { SCOPES, type AgentId, type AgentNode, type Harness, type MessageLink, type Scope, type SourceKind } from "../domain.ts";
 import { compactNumber, shortPath, working } from "../format.ts";
 import { countsOf, isLive, rootOf, rootsOf, treeOf, withoutSkills } from "../graph.ts";
-import type { Delta, JournalRequest, JournalResponse, JournalState, PstackSetup, ResetResponse, ServerInfo, Snapshot, SourceHealth, TimelineAppend, TimelinePage } from "../wire.ts";
+import type { Delta, JournalRequest, JournalResponse, JournalState, PstackSetup, ResetResponse, ServerInfo, SheetWriteRequest, SheetWriteResponse, Snapshot, SourceHealth, TimelineAppend, TimelinePage } from "../wire.ts";
 import { Canvas } from "./canvas.ts";
 import { Explorer } from "./explorer.ts";
 import { postJson } from "./commands.ts";
@@ -132,7 +132,7 @@ const panel = new Panel({
   resized: (width, settled) => setRightInset(insetFor(width), settled),
 });
 const rail = new Rail({ select: (root) => selectSession(root), scope: (next) => setScope(next) });
-const setupView = new SetupView({ refresh: () => void fetchSetup(), journal: (request) => changeJournal(request) });
+const setupView = new SetupView({ refresh: () => void fetchSetup(), journal: (request) => changeJournal(request), sheet: (request) => writeSheet(request) });
 
 const sessionTitle = h("h1", { class: "bar-title" });
 const sessionPath = h("span", { class: "bar-path mono" });
@@ -226,6 +226,17 @@ function setScope(next: Scope): void {
   }
   render();
   connect();
+}
+
+async function writeSheet(request: SheetWriteRequest): Promise<SheetWriteResponse> {
+  let result: SheetWriteResponse;
+  try {
+    result = (await postJson<SheetWriteResponse>("/api/sheet", request)).data;
+  } catch {
+    result = { ok: false, message: "Could not reach the monitor.", path: null, errors: [], warnings: [] };
+  }
+  await fetchSetup();
+  return result;
 }
 
 async function changeJournal(request: JournalRequest): Promise<string | null> {

@@ -1758,6 +1758,35 @@ body[data-view="setup"] .rail-toggle { display: none; }
 .setting-how { color: var(--text-2); }
 .lane-chips { display: flex; flex-wrap: wrap; gap: 5px; }
 
+/* The model sheet editor. */
+.sheet-select,
+.sheet-input {
+  max-width: 100%;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--layer);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+}
+.sheet-select { padding-right: 24px; }
+.sheet-select:hover, .sheet-input:hover { border-color: var(--line-strong); }
+.sheet-input { width: 200px; }
+.sheet-input:focus-visible { outline-offset: 0; border-color: var(--accent); }
+.sheet-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.sheet-check { display: inline-flex; align-items: center; gap: 6px; color: var(--text-2); font-size: 12px; }
+.lane-editors { display: grid; gap: 6px; justify-items: start; }
+.lane-editor { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.lane-remove .icon { width: 13px; height: 13px; }
+.lane-add .icon { width: 12px; height: 12px; }
+.sheet-edit th { vertical-align: top; padding-top: 12px; }
+.sheet-problems { margin: 0; padding-left: 18px; color: var(--attention); font-size: 12.5px; line-height: 1.5; max-width: 78ch; }
+.sheet-problems[data-level="warn"] { color: var(--text-2); }
+.setup-note[data-ok="false"] { color: var(--attention); }
+.setup-note[data-ok="true"] { color: var(--done); }
+.quiet { color: var(--text-3); }
+
 /* The journal's lane list. */
 .table-scroll { overflow-x: auto; }
 .lane-table th { width: auto; white-space: nowrap; color: var(--text-3); font-size: 11.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }

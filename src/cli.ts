@@ -183,7 +183,7 @@ export async function main(
     case "serve":
       return serve(where, { port: options.port, windowHours: options.hours, assets: buildAssets }, io);
     case "setup":
-      io.stdout(renderSetup(diskSetup(where)));
+      io.stdout(renderSetup(diskSetup(where, [process.cwd()])));
       return 0;
     case "doctor": {
       const report = await diagnose(where, Date.now() - options.hours * 3_600_000);

@@ -522,6 +522,17 @@ export class Store implements StatusView {
     return this.agents.has(id);
   }
 
+  /** Every distinct working directory an indexed session root reported, most recent first. */
+  cwds(): string[] {
+    const latest = new Map<string, string>();
+    for (const agent of this.agents.values()) {
+      if (agent.cwd === null || agent.flavor.kind !== "session") continue;
+      const at = agent.lastActivityAt ?? agent.startedAt ?? "";
+      if (at >= (latest.get(agent.cwd) ?? "")) latest.set(agent.cwd, at);
+    }
+    return [...latest].sort((a, b) => b[1].localeCompare(a[1])).map(([cwd]) => cwd);
+  }
+
   currentSkill(id: AgentId): AgentId | null {
     return this.currentSkills.get(id) ?? null;
   }

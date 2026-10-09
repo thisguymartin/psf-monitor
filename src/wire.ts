@@ -161,11 +161,44 @@ export interface SheetRole {
   readonly lanes: readonly string[];
 }
 
+export type SheetScope = "global" | "project";
+
 export interface ModelSheet {
   readonly harness: Harness;
+  readonly scope: SheetScope;
   readonly path: string;
   readonly present: boolean;
   readonly roles: readonly SheetRole[];
+  /** True when the monitor may write this file: any project sheet, or a global sheet that already exists. */
+  readonly writable: boolean;
+  /** True when the monitor wrote it without pstack's live model probe. */
+  readonly unprobed: boolean;
+}
+
+/** A git project the monitor saw sessions in, with its per-harness sheets. A project sheet replaces the global one whole. */
+export interface ProjectSetup {
+  readonly root: string;
+  readonly name: string;
+  /** Sessions in the indexed window whose working directory is inside this project. */
+  readonly sessions: number;
+  readonly sheets: readonly ModelSheet[];
+}
+
+export interface SheetWriteRequest {
+  readonly harness: Harness;
+  readonly scope: SheetScope;
+  /** The project root from `PstackSetup.projects`; null for the global sheet. */
+  readonly root: string | null;
+  /** The whole sheet to write, or null to delete a project sheet. */
+  readonly roles: readonly SheetRole[] | null;
+  /** The operator accepted a single-provider panel. */
+  readonly confirmDiversity: boolean;
+}
+
+export interface SheetWriteResponse extends ActionResponse {
+  readonly path: string | null;
+  readonly errors: readonly string[];
+  readonly warnings: readonly string[];
 }
 
 export interface SetupSetting {
@@ -180,6 +213,7 @@ export interface PstackSetup {
   readonly skills: readonly SkillInfo[];
   readonly providers: readonly ProviderSetup[];
   readonly sheets: readonly ModelSheet[];
+  readonly projects: readonly ProjectSetup[];
   /** The roles pstack uses until a sheet is written. */
   readonly defaults: readonly SheetRole[];
   readonly settings: readonly SetupSetting[];

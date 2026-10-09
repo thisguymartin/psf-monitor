@@ -29,7 +29,9 @@ The first `start` also turns on pstack's lane journal and says so on stderr. Rel
 
 `stop` ends the monitor only, never an agent. To cancel a running pstack lane, the user clicks Cancel in that lane's panel on the page. To stop a Claude Code, Codex, or OpenCode session, the user interrupts it in its own terminal.
 
-`setup` prints which providers can run a lane and what stops the others; it reports whether an API key is set, never the key. The page shows the same under **Setup**, with the commands that store and load a missing key. To change a role's model, the user runs `/pstack:setup-pstack`.
+`setup` prints which providers can run a lane and what stops the others; it reports whether an API key is set, never the key. It also prints the model sheets for the current project and the global ones. The page shows the same under **Setup**, with the commands that store and load a missing key.
+
+Under **Setup → Model roles** the user can pick a project's sheet or the global one and change which model and effort each role runs on, move every lane to one model, or create and delete a project sheet. The monitor validates against the installed matrix but does not probe models; a sheet it wrote shows **not probed**. When the user wants a lane proven, or wants a global sheet created, point them to `/pstack:setup-pstack`.
 
 `psf-monitor doctor` reports how well recent transcripts parsed. Run it when the page warns that a source is degraded, and relay the result.
 

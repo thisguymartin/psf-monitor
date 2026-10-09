@@ -1,6 +1,6 @@
 import type { AgentId, AgentNode, Harness } from "../domain.ts";
 import { ago, compactNumber, working } from "../format.ts";
-import type { JournalRequest, JournalState, LaneSummary, ModelSheet, ProviderSetup, PstackSetup, ServerInfo, SheetRole, SkillInfo } from "../wire.ts";
+import type { JournalRequest, JournalState, LaneSummary, ModelSheet, ProjectSetup, ProviderSetup, PstackSetup, ServerInfo, SheetRole, SheetWriteRequest, SheetWriteResponse, SkillInfo } from "../wire.ts";
 import { h, icon, providerIcon } from "./dom.ts";
 
 // The setup view: what pstack has installed, which providers can run a lane,
@@ -13,6 +13,76 @@ export interface SetupEvents {
   refresh(): void;
   /** Changes the lane journal; resolves to an error message, or null when the change went through. */
   journal(request: JournalRequest): Promise<string | null>;
+  /** Writes or deletes a model sheet and refreshes the setup afterwards. */
+  sheet(request: SheetWriteRequest): Promise<SheetWriteResponse>;
+}
+
+/** One sheet the page can show or edit: a global sheet, or one project's sheet for one harness. */
+interface SheetChoice {
+  readonly key: string;
+  readonly title: string;
+  readonly sheet: ModelSheet;
+  readonly project: ProjectSetup | null;
+}
+
+/** A matrix family the editor can put on a lane, as `provider:model` plus its efforts. */
+interface FamilyOption {
+  readonly value: string;
+  readonly provider: string;
+  readonly model: string;
+  readonly label: string;
+  readonly efforts: readonly string[];
+  readonly defaultEffort: string;
+  /** An open row: the model id is typed, not picked. */
+  readonly open: boolean;
+  readonly blocked: string | null;
+}
+
+const ALIASES = ["inherit-parent", "auto"] as const;
+const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+
+function familyOptions(setup: PstackSetup): FamilyOption[] {
+  const options: FamilyOption[] = [];
+  for (const provider of setup.providers) {
+    for (const family of provider.families) {
+      const open = family.model.startsWith("<");
+      options.push({
+        value: open ? `${provider.provider}:` : `${provider.provider}:${family.model}`,
+        provider: provider.provider,
+        model: open ? "" : family.model,
+        label: open ? `${provider.provider}: any model id…` : `${provider.provider}:${family.model}`,
+        efforts: family.efforts.length > 0 ? family.efforts : EFFORTS,
+        defaultEffort: family.defaultEffort.length > 0 ? family.defaultEffort : "high",
+        open,
+        blocked: provider.blocked,
+      });
+    }
+  }
+  return options;
+}
+
+function splitLane(lane: string): { provider: string; model: string; effort: string } | null {
+  const colon = lane.indexOf(":");
+  const at = lane.lastIndexOf("@");
+  if (colon < 1 || at <= colon + 1) return null;
+  return { provider: lane.slice(0, colon), model: lane.slice(colon + 1, at), effort: lane.slice(at + 1) };
+}
+
+function sheetChoices(setup: PstackSetup): SheetChoice[] {
+  const choices: SheetChoice[] = [];
+  for (const project of setup.projects) {
+    for (const sheet of project.sheets) choices.push({ key: `project:${project.root}:${sheet.harness}`, title: `${project.name} · ${HARNESS_NAME[sheet.harness]}`, sheet, project });
+  }
+  for (const sheet of setup.sheets) choices.push({ key: `global:${sheet.harness}`, title: `Global · ${HARNESS_NAME[sheet.harness]}`, sheet, project: null });
+  return choices;
+}
+
+/** The roles pstack would use for a choice right now: its own sheet, else the global one, else the first-run defaults. */
+function effectiveRoles(choice: SheetChoice, setup: PstackSetup): { roles: readonly SheetRole[]; from: "project" | "global" | "defaults" } {
+  if (choice.sheet.present) return { roles: choice.sheet.roles, from: choice.sheet.scope === "project" ? "project" : "global" };
+  const global = setup.sheets.find((sheet) => sheet.harness === choice.sheet.harness);
+  if (global?.present) return { roles: global.roles, from: "global" };
+  return { roles: setup.defaults, from: "defaults" };
 }
 
 export interface SetupInput {
@@ -157,6 +227,14 @@ export class SetupView {
   private readonly armed = new Map<string, number>();
   private busy: string | null = null;
   private journalMessage: string | null = null;
+  /** The sheet shown in Model roles; null picks the first project, else the global Claude sheet. */
+  private sheetKey: string | null = null;
+  /** A copy of the roles being edited; null when reading. */
+  private draft: { role: string; lanes: string[] }[] | null = null;
+  private confirmDiversity = false;
+  private moveTo = "";
+  private sheetResult: SheetWriteResponse | null = null;
+  private sheetBusy = false;
 
   constructor(private readonly events: SetupEvents) {
     this.element = h("section", { class: "setup", attrs: { hidden: "", "aria-label": "pstack setup" } }, this.body);
@@ -176,7 +254,7 @@ export class SetupView {
     const usage = usageOf(input.nodes, input.now);
     // Rebuild only when something shown changed, so a filter being typed keeps its focus and scroll.
     // The minute keeps "2m ago" honest.
-    const signature = JSON.stringify([input.setup, input.error, input.journal, input.journalError, this.busy, this.journalMessage, [...this.armed], input.server?.journal, input.server?.windowHours, [...usage.skills], [...usage.providers], Math.floor(input.now / 60_000)]);
+    const signature = JSON.stringify([input.setup, input.error, input.journal, input.journalError, this.busy, this.journalMessage, [...this.armed], this.sheetKey, this.draft, this.confirmDiversity, this.moveTo, this.sheetResult, this.sheetBusy, input.server?.journal, input.server?.windowHours, [...usage.skills], [...usage.providers], Math.floor(input.now / 60_000)]);
     if (signature === this.drawn) return;
     this.drawn = signature;
 
@@ -336,38 +414,197 @@ export class SetupView {
 
   // --- model roles -------------------------------------------------------------
 
+  private laneChip(value: string, blocked: ReadonlyMap<string, string>): HTMLElement {
+    const provider = providerOf(value);
+    if (provider === null) return h("span", { class: "lane-chip", text: value, attrs: { "data-alias": "true" } });
+    const reason = blocked.get(provider);
+    return h(
+      "span",
+      { class: "lane-chip", title: reason === undefined ? value : `${value}\nwould not start: ${reason}`, attrs: { "data-provider": provider, ...(reason === undefined ? {} : { "data-blocked": "true" }) } },
+      h("i", { attrs: { "aria-hidden": "true" } }),
+      value.slice(provider.length + 1),
+      reason === undefined ? null : icon("alert"),
+    );
+  }
+
+  private currentChoice(setup: PstackSetup): SheetChoice | null {
+    const choices = sheetChoices(setup);
+    return choices.find((choice) => choice.key === this.sheetKey) ?? choices[0] ?? null;
+  }
+
+  private selectSheet(key: string): void {
+    this.sheetKey = key;
+    this.draft = null;
+    this.sheetResult = null;
+    this.confirmDiversity = false;
+    this.rerender();
+  }
+
+  private startEditing(roles: readonly SheetRole[]): void {
+    this.draft = roles.map((role) => ({ role: role.role, lanes: [...role.lanes] }));
+    this.sheetResult = null;
+    this.confirmDiversity = false;
+    this.moveTo = "";
+    this.rerender();
+  }
+
+  private async submitSheet(choice: SheetChoice, roles: readonly SheetRole[] | null): Promise<void> {
+    this.sheetBusy = true;
+    this.sheetResult = null;
+    this.rerender();
+    const result = await this.events.sheet({ harness: choice.sheet.harness, scope: choice.sheet.scope, root: choice.project?.root ?? null, roles, confirmDiversity: this.confirmDiversity });
+    this.sheetBusy = false;
+    this.sheetResult = result;
+    if (result.ok) this.draft = null;
+    this.rerender();
+  }
+
+  /** One lane's controls: what runs it, at which effort, and a way to drop it. */
+  private laneEditor(lane: string, families: readonly FamilyOption[], update: (next: string) => void, remove: () => void): HTMLElement {
+    const parts = splitLane(lane);
+    const alias = (ALIASES as readonly string[]).includes(lane);
+    const family = parts === null ? undefined : families.find((option) => option.provider === parts.provider && (option.open || option.model === parts.model));
+    const picked = alias ? lane : family === undefined ? "" : family.value;
+    const what = h("select", { class: "sheet-select", attrs: { "aria-label": "Model for this lane" } },
+      picked === "" ? h("option", { text: lane.length === 0 ? "choose…" : lane, attrs: { value: "", disabled: "" } }) : null,
+      ...ALIASES.map((value) => h("option", { text: value, attrs: { value } })),
+      ...families.map((option) => h("option", { text: option.blocked === null ? option.label : `${option.label} (cannot start)`, attrs: { value: option.value } })),
+    );
+    what.value = picked;
+    what.addEventListener("change", () => {
+      const next = families.find((option) => option.value === what.value);
+      if (next === undefined) update(what.value);
+      else update(next.open ? `${next.provider}:${parts?.provider === next.provider ? parts.model : ""}@${next.defaultEffort}` : `${next.value}@${next.defaultEffort}`);
+    });
+    const modelInput = family?.open === true
+      ? h("input", { class: "sheet-input mono", attrs: { type: "text", placeholder: family.provider === "openrouter" ? "namespace/model" : "provider/model", "aria-label": "Model id", spellcheck: "false", value: parts?.model ?? "" } })
+      : null;
+    modelInput?.addEventListener("change", () => update(`${family!.provider}:${modelInput.value.trim()}@${parts?.effort ?? family!.defaultEffort}`));
+    const efforts = family?.efforts ?? EFFORTS;
+    const effort = alias ? null : h("select", { class: "sheet-select", attrs: { "aria-label": "Effort" } }, ...efforts.map((value) => h("option", { text: `@${value}`, attrs: { value } })));
+    if (effort !== null && parts !== null) effort.value = efforts.includes(parts.effort) ? parts.effort : (family?.defaultEffort ?? efforts[0]!);
+    effort?.addEventListener("change", () => update(`${parts!.provider}:${parts!.model}@${effort.value}`));
+    const drop = h("button", { class: "icon-button lane-remove", title: "Remove this lane", attrs: { type: "button", "aria-label": "Remove this lane" } }, icon("close"));
+    drop.addEventListener("click", remove);
+    return h("div", { class: "lane-editor" }, what, modelInput, effort, drop);
+  }
+
   private roles(setup: PstackSetup): HTMLElement {
     const blocked = new Map(setup.providers.filter((provider) => provider.blocked !== null).map((provider) => [provider.provider, provider.blocked!]));
-    const sheets = activeSheets(setup);
-    const written = setup.sheets.some((sheet) => sheet.present);
-    const lane = (value: string): HTMLElement => {
-      const provider = providerOf(value);
-      if (provider === null) return h("span", { class: "lane-chip", text: value, attrs: { "data-alias": "true" } });
-      const reason = blocked.get(provider);
-      return h(
-        "span",
-        { class: "lane-chip", title: reason === undefined ? value : `${value}\nwould not start: ${reason}`, attrs: { "data-provider": provider, ...(reason === undefined ? {} : { "data-blocked": "true" }) } },
-        h("i", { attrs: { "aria-hidden": "true" } }),
-        value.slice(provider.length + 1),
-        reason === undefined ? null : icon("alert"),
+    const choices = sheetChoices(setup);
+    const choice = this.currentChoice(setup);
+    const families = familyOptions(setup);
+    const picker = h("select", { class: "sheet-select", attrs: { "aria-label": "Which model sheet to show" } },
+      ...choices.map((entry) => h("option", { text: `${entry.title}${entry.sheet.present ? "" : entry.project === null ? " (not written)" : " (uses global)"}`, attrs: { value: entry.key } })));
+    if (choice !== null) picker.value = choice.key;
+    picker.addEventListener("change", () => this.selectSheet(picker.value));
+
+    const children: (Node | null)[] = [];
+    if (choice === null) {
+      children.push(h("p", { class: "setup-lede", text: "The installed pstack lists no roles." }));
+    } else {
+      const effective = effectiveRoles(choice, setup);
+      const sheet = choice.sheet;
+      const status = h("p", { class: "setup-lede" },
+        sheet.present
+          ? h("span", {}, `pstack reads this sheet for ${choice.project === null ? "every project without its own sheet" : `work in ${choice.project.name}`} under ${HARNESS_NAME[sheet.harness]}. `)
+          : choice.project === null
+            ? h("span", {}, `No global ${HARNESS_NAME[sheet.harness]} sheet is written; pstack uses ${effective.from === "defaults" ? "its first-run roles" : "the global sheet"}. `)
+            : h("span", {}, `${choice.project.name} has no ${HARNESS_NAME[sheet.harness]} sheet of its own, so it uses ${effective.from === "global" ? "the global sheet" : "pstack's first-run roles"} shown here. `),
+        sheet.unprobed ? chip("not probed", "warn") : sheet.present ? chip("probed by setup", "ok") : null,
+        choice.project !== null ? h("span", { class: "quiet", text: ` ${plural(choice.project.sessions, "session")} in the window` }) : null,
       );
-    };
+      children.push(status, h("div", { class: "sheet-head" }, h("span", { class: "mono sheet-path", title: sheet.path, text: sheet.path })));
+
+      if (this.draft === null) {
+        const edit = h("button", { class: "quiet-action", attrs: { type: "button" } }, icon("sliders"), h("span", { text: sheet.present ? "Edit" : choice.project === null ? "Edit (run setup first)" : "Create project sheet" }));
+        edit.disabled = !sheet.writable || effective.roles.length === 0;
+        if (!sheet.writable) edit.title = "The monitor creates project sheets; a global sheet starts with /pstack:setup-pstack, which also wires it into the harness.";
+        edit.addEventListener("click", () => this.startEditing(effective.roles));
+        const remove = sheet.present && choice.project !== null
+          ? this.armedButton("sheet-delete", "Delete project sheet", "Delete this sheet and use the global one?", () => void this.submitSheet(choice, null))
+          : null;
+        children.push(
+          h("div", { class: "sheet-tools" }, edit, remove),
+          h("table", { class: "role-table" }, h("tbody", {}, ...effective.roles.map((role) => h("tr", {}, h("th", { text: role.role, attrs: { scope: "row" } }), h("td", {}, h("div", { class: "lane-chips" }, ...role.lanes.map((lane) => this.laneChip(lane, blocked)))))))),
+        );
+      } else {
+        const draft = this.draft;
+        const move = h("select", { class: "sheet-select", attrs: { "aria-label": "Move every lane to one model" } },
+          h("option", { text: "Move every lane to…", attrs: { value: "" } }),
+          ...families.filter((option) => !option.open).map((option) => h("option", { text: option.label, attrs: { value: option.value } })));
+        move.value = this.moveTo;
+        move.addEventListener("change", () => { this.moveTo = move.value; this.rerender(); });
+        const apply = h("button", { class: "quiet-action", attrs: { type: "button" }, title: "Every lane that names a model moves; inherit-parent and auto stay. A panel that would repeat one lane keeps one." }, h("span", { text: "Apply to all" }));
+        apply.disabled = this.moveTo === "";
+        apply.addEventListener("click", () => {
+          const target = families.find((option) => option.value === this.moveTo);
+          if (target === undefined) return;
+          for (const role of draft) {
+            const moved = role.lanes.map((lane) => ((ALIASES as readonly string[]).includes(lane) ? lane : `${target.value}@${target.defaultEffort}`));
+            role.lanes = moved.filter((lane, index) => moved.indexOf(lane) === index);
+          }
+          this.sheetResult = null;
+          this.rerender();
+        });
+        const rows = draft.map((role, roleIndex) => {
+          const add = h("button", { class: "quiet-action lane-add", attrs: { type: "button" } }, icon("plus"), h("span", { text: "lane" }));
+          add.addEventListener("click", () => { role.lanes.push(""); this.rerender(); });
+          return h("tr", {},
+            h("th", { text: role.role, attrs: { scope: "row" } }),
+            h("td", {}, h("div", { class: "lane-editors" },
+              ...role.lanes.map((lane, laneIndex) => this.laneEditor(lane, families,
+                (next) => { draft[roleIndex]!.lanes[laneIndex] = next; this.sheetResult = null; this.rerender(); },
+                () => { draft[roleIndex]!.lanes.splice(laneIndex, 1); this.sheetResult = null; this.rerender(); })),
+              add)));
+        });
+        const diversity = h("input", { attrs: { type: "checkbox" } });
+        diversity.checked = this.confirmDiversity;
+        diversity.addEventListener("change", () => { this.confirmDiversity = diversity.checked; });
+        const save = h("button", { class: "quiet-action", attrs: { type: "button", "aria-pressed": "true" } }, icon("check"), h("span", { text: this.sheetBusy ? "Writing…" : "Save sheet" }));
+        save.disabled = this.sheetBusy || draft.some((role) => role.lanes.length === 0 || role.lanes.some((lane) => lane.length === 0 || lane.endsWith(":@") || /:@[a-z]+$/.test(lane)));
+        save.addEventListener("click", () => void this.submitSheet(choice, draft.map((role) => ({ role: role.role, lanes: [...role.lanes] }))));
+        const discard = h("button", { class: "quiet-action", attrs: { type: "button" } }, h("span", { text: "Discard" }));
+        discard.disabled = this.sheetBusy;
+        discard.addEventListener("click", () => { this.draft = null; this.sheetResult = null; this.rerender(); });
+        children.push(
+          h("div", { class: "sheet-tools" }, move, apply),
+          h("table", { class: "role-table sheet-edit" }, h("tbody", {}, ...rows)),
+          h("div", { class: "sheet-tools" }, save, discard, h("label", { class: "sheet-check" }, diversity, "accept a single-provider panel")),
+        );
+      }
+      const result = this.sheetResult;
+      if (result !== null) {
+        children.push(h("p", { class: "setup-note", attrs: { role: "status", "data-ok": String(result.ok) }, text: result.message }));
+        if (result.errors.length > 1) children.push(h("ul", { class: "sheet-problems" }, ...result.errors.map((error) => h("li", { text: error }))));
+        if (result.warnings.length > 0) children.push(h("ul", { class: "sheet-problems", attrs: { "data-level": "warn" } }, ...result.warnings.map((warning) => h("li", { text: warning }))));
+      }
+    }
     return h(
       "section",
       { class: "setup-section" },
-      h("div", { class: "setup-title" }, h("h3", { text: "Model roles" })),
-      h("p", { class: "setup-lede" }, written
-        ? "Each role runs on the lanes listed here, one lane per entry. "
-        : "No model sheet is written yet, so pstack uses its first-run roles. ", "A lane marked with a warning would not start with the providers above."),
-      ...sheets.map((sheet) => h(
-        "div",
-        { class: "sheet" },
-        h("div", { class: "sheet-head" }, h("span", { class: "sheet-name", text: sheet.title }), sheet.path === null ? null : h("span", { class: "mono sheet-path", text: sheet.path })),
-        h("table", { class: "role-table" }, h("tbody", {}, ...sheet.roles.map((role) => h("tr", {}, h("th", { text: role.role, attrs: { scope: "row" } }), h("td", {}, h("div", { class: "lane-chips" }, ...role.lanes.map(lane))))))),
-      )),
-      sheets.length === 0 ? h("p", { class: "setup-lede", text: "The installed pstack lists no roles." }) : null,
-      h("div", { class: "guide" }, h("p", { text: "Change a role's model or a family's effort with setup. It probes every assigned model first and writes the sheet only when all of them answer." }), command(SETUP_COMMAND)),
+      h("div", { class: "setup-title" }, h("h3", { text: "Model roles" }), h("div", { class: "setup-tools" }, picker)),
+      ...children,
+      h("div", { class: "guide" }, h("p", { text: "A sheet written here is checked against the installed model matrix but not probed. Setup probes every assigned model live and rewrites the sheet; run it when a lane should be proven before real work." }), command(SETUP_COMMAND)),
     );
+  }
+
+  /** A button that asks for a second click within four seconds before acting. */
+  private armedButton(key: string, label: string, confirm: string, act: () => void): HTMLButtonElement {
+    const armed = (this.armed.get(key) ?? 0) > Date.now();
+    const button = h("button", { class: "quiet-action", attrs: { type: "button" } }, h("span", { text: armed ? `Confirm: ${confirm}` : label }));
+    button.disabled = this.sheetBusy;
+    button.addEventListener("click", () => {
+      if ((this.armed.get(key) ?? 0) <= Date.now()) {
+        this.armed.set(key, Date.now() + 4_000);
+        this.rerender();
+        window.setTimeout(() => this.rerender(), 4_050);
+        return;
+      }
+      this.armed.delete(key);
+      act();
+    });
+    return button;
   }
 
   // --- skills ------------------------------------------------------------------
