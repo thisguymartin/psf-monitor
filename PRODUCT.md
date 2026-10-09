@@ -12,6 +12,8 @@ Developers monitoring local pstack sessions across Claude Code, Codex, subagents
 
 ## Workflows
 
+Persistent navigation splits Overview, Sessions, Providers, Model roles, Skills, Journal, and Settings into focused pages. Overview prioritizes running work and issues needing attention, with observed model usage below. Agent rows open their session details. Browser Back and Forward retain page history, and model drafts survive in-app navigation.
+
 The default session view is a nested, expandable list, confirmed by the user. Status and search filters narrow the visible work. A Runs view provides expandable summaries inspired by GitHub Actions; Graph retains the relationship map. Selecting an agent opens its existing live transcript and actions.
 
 ## Constraints

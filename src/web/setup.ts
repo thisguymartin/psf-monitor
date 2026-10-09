@@ -1,7 +1,8 @@
-import type { AgentId, AgentNode, Harness } from "../domain.ts";
+import type { AgentId, AgentNode, Harness, Scope } from "../domain.ts";
 import { ago, compactNumber, working } from "../format.ts";
 import type { JournalRequest, JournalState, LaneSummary, ModelSheet, ProjectSetup, ProviderSetup, PstackSetup, ServerInfo, SheetRole, SheetWriteRequest, SheetWriteResponse, SkillInfo } from "../wire.ts";
 import { h, icon, providerIcon } from "./dom.ts";
+import { PAGE_LABEL, type SetupPage } from "../navigation.ts";
 
 // The setup view: what pstack has installed, which providers can run a lane,
 // which model each role uses, what the lane journal holds, and how to change each of those.
@@ -86,6 +87,8 @@ function effectiveRoles(choice: SheetChoice, setup: PstackSetup): { roles: reado
 }
 
 export interface SetupInput {
+  readonly page: SetupPage;
+  readonly scope: Scope;
   readonly setup: PstackSetup | null;
   readonly error: string | null;
   readonly journal: JournalState | null;
@@ -140,10 +143,11 @@ function count(usage: Usage, node: AgentNode, now: number): void {
 }
 
 /** Skill runs by skill name, and spawned subagents and lanes by provider. */
-function usageOf(nodes: ReadonlyMap<AgentId, AgentNode>, now: number): { skills: Map<string, Usage>; providers: Map<string, Usage> } {
+function usageOf(nodes: ReadonlyMap<AgentId, AgentNode>, now: number, scope: Scope): { skills: Map<string, Usage>; providers: Map<string, Usage> } {
   const skills = new Map<string, Usage>();
   const providers = new Map<string, Usage>();
   for (const node of nodes.values()) {
+    if (scope !== "all" && node.pstack !== (scope === "pstack")) continue;
     if (node.flavor.kind === "skill") count(usageFor(skills, node.flavor.skill.replace(/^pstack:/, "")), node, now);
     else if (node.flavor.kind !== "session") count(usageFor(providers, node.model.provider), node, now);
   }
@@ -235,6 +239,9 @@ export class SetupView {
   private moveTo = "";
   private sheetResult: SheetWriteResponse | null = null;
   private sheetBusy = false;
+  private readonly openProviders = new Set<string>();
+
+  get hasDraft(): boolean { return this.draft !== null; }
 
   constructor(private readonly events: SetupEvents) {
     this.element = h("section", { class: "setup", attrs: { hidden: "", "aria-label": "pstack setup" } }, this.body);
@@ -249,38 +256,42 @@ export class SetupView {
     });
   }
 
-  render(input: SetupInput): void {
+  render(input: SetupInput, force = false): void {
+    const previousPage = this.last?.page;
     this.last = input;
-    const usage = usageOf(input.nodes, input.now);
+    if (!force && this.draft !== null && previousPage === "models" && input.page === "models") return;
+    const usage = usageOf(input.nodes, input.now, input.scope);
     // Rebuild only when something shown changed, so a filter being typed keeps its focus and scroll.
     // The minute keeps "2m ago" honest.
-    const signature = JSON.stringify([input.setup, input.error, input.journal, input.journalError, this.busy, this.journalMessage, [...this.armed], this.sheetKey, this.draft, this.confirmDiversity, this.moveTo, this.sheetResult, this.sheetBusy, input.server?.journal, input.server?.windowHours, [...usage.skills], [...usage.providers], Math.floor(input.now / 60_000)]);
+    const signature = JSON.stringify([input.page, input.scope, input.setup, input.error, input.journal, input.journalError, this.busy, this.journalMessage, [...this.armed], this.sheetKey, this.draft, this.confirmDiversity, this.moveTo, this.sheetResult, this.sheetBusy, input.server?.journal, input.server?.windowHours, [...usage.skills], [...usage.providers], Math.floor(input.now / 60_000)]);
     if (signature === this.drawn) return;
     this.drawn = signature;
 
-    if (input.setup === null) {
-      this.body.replaceChildren(
-        h("div", { class: "setup-wait" }, h("p", { text: input.error ?? "Reading the pstack setup…" }), input.error === null ? null : this.refreshButton("Try again")),
-      );
-      return;
-    }
-    const setup = input.setup;
+    this.element.setAttribute("aria-label", PAGE_LABEL[input.page]);
+    this.element.dataset.page = input.page;
     const typing = document.activeElement === this.search;
-    this.body.replaceChildren(
-      this.head(setup),
-      this.providers(setup, usage.providers, input),
-      this.roles(setup),
-      this.skillsSection(),
-      this.journalSection(input),
-      this.settings(setup, input),
-    );
-    this.drawSkills(setup, usage.skills, input.now);
-    if (typing) this.search.focus();
+    const focused = document.activeElement instanceof HTMLElement && this.body.contains(document.activeElement) ? document.activeElement.dataset.focus : undefined;
+    let section: HTMLElement;
+    if (input.page === "journal") section = this.journalSection(input);
+    else if (input.setup === null) {
+      section = h("div", { class: "setup-wait" }, h("p", { text: input.error ?? "Reading local configuration…" }), input.error === null ? null : this.refreshButton("Try again"));
+    } else {
+      switch (input.page) {
+        case "providers": section = this.providers(input.setup, usage.providers, input); break;
+        case "models": section = this.roles(input.setup); break;
+        case "skills": section = this.skillsSection(); break;
+        case "settings": section = this.settings(input.setup, input); break;
+      }
+    }
+    this.body.replaceChildren(this.head(input), section);
+    if (input.page === "skills" && input.setup !== null) this.drawSkills(input.setup, usage.skills, input.now);
+    if (typing && input.page === "skills") this.search.focus();
+    else if (focused !== undefined) this.body.querySelectorAll<HTMLElement>("[data-focus]").forEach((element) => { if (element.dataset.focus === focused) element.focus({ preventScroll: true }); });
   }
 
   private redraw(): void {
     if (this.last?.setup == null) return;
-    this.drawSkills(this.last.setup, usageOf(this.last.nodes, this.last.now).skills, this.last.now);
+    this.drawSkills(this.last.setup, usageOf(this.last.nodes, this.last.now, this.last.scope).skills, this.last.now);
   }
 
   private refreshButton(label: string): HTMLElement {
@@ -289,16 +300,17 @@ export class SetupView {
     return button;
   }
 
-  private head(setup: PstackSetup): HTMLElement {
-    const installed = setup.installs.length === 0
-      ? "pstack is not installed in Claude Code or Codex on this machine."
-      : `pstack ${setup.installs.map((install) => `${install.version ?? "?"} in ${HARNESS_NAME[install.harness]}`).join(", ")}`;
-    return h(
-      "header",
-      { class: "setup-head" },
-      h("div", {}, h("h2", { text: "pstack setup" }), h("p", { text: installed })),
-      this.refreshButton("Refresh"),
-    );
+  private head(input: SetupInput): HTMLElement {
+    const scope = input.scope === "all" ? "All sessions" : input.scope === "pstack" ? "pstack sessions" : "Other sessions";
+    const descriptions: Record<SetupPage, string> = {
+      providers: `Provider availability and observed use · ${scope} · Last ${input.server?.windowHours ?? 24} hours`,
+      models: "Choose which models each role runs. Project sheets override the global sheet.",
+      skills: `Installed skills and where they are used · ${scope} · Last ${input.server?.windowHours ?? 24} hours`,
+      journal: "Recorded model lanes across all sessions. Inspect outcomes and manage local records.",
+      settings: "Monitor version, source directories, and local configuration.",
+    };
+    return h("header", { class: "setup-head" },
+      h("div", {}, h("h2", { text: PAGE_LABEL[input.page] }), h("p", { text: descriptions[input.page] })), this.refreshButton("Refresh"));
   }
 
   // --- providers ---------------------------------------------------------------
@@ -312,11 +324,11 @@ export class SetupView {
     return h(
       "section",
       { class: "setup-section" },
-      h("div", { class: "setup-title" }, h("h3", { text: "Providers" }), h("span", { class: "rail-count", text: `${ready} of ${setup.providers.length} ready` })),
+      h("div", { class: "setup-title" }, h("h3", { text: "Availability" }), h("span", { class: "rail-count", text: `${ready} of ${setup.providers.length} ready` })),
       h(
         "div",
         { class: "provider-grid" },
-        ...setup.providers.map((provider) => this.provider(provider, setup, usage.get(provider.provider), hours, input.now)),
+        ...[...setup.providers].sort((a, b) => (usage.get(b.provider)?.running ?? 0) - (usage.get(a.provider)?.running ?? 0) || (usage.get(b.provider)?.runs ?? 0) - (usage.get(a.provider)?.runs ?? 0)).map((provider) => this.provider(provider, setup, usage.get(provider.provider), hours, input.now)),
         ...extra.map((provider) => this.unlisted(provider, usage.get(provider), hours, input.now)),
       ),
       h("p", { class: "setup-note", text: "Key and CLI checks use the environment this monitor started with. A lane reads its key from the session that launches it, so start the monitor from the same shell to keep the two in step." }),
@@ -341,6 +353,11 @@ export class SetupView {
     fact("Roles", roles.length === 0 ? h("span", { class: "quiet", text: "none assigned" }) : h("span", { title: roles.join("\n"), text: roles.join(" · ") }));
     fact(`Last ${hours}h`, h("span", { class: usage === undefined ? "quiet" : "", text: usageText(usage, "agent", now) }));
 
+    const details = h("details", { class: "provider-details" },
+      h("summary", { text: "Configuration and setup", attrs: { "data-focus": `provider:${provider.provider}` } }), facts, this.guide(provider, roles.length > 0, setup.platform),
+      gateway === null ? null : h("p", { class: "provider-vars" }, "Change with ", h("code", { text: gateway.baseUrlVar }), ", ", h("code", { text: gateway.configDirVar }), ", ", h("code", { text: gateway.maxContextVar })));
+    details.open = this.openProviders.has(provider.provider);
+    details.addEventListener("toggle", () => { if (details.open) this.openProviders.add(provider.provider); else this.openProviders.delete(provider.provider); });
     return h(
       "article",
       { class: "provider", attrs: { "data-provider": provider.provider, "data-ready": String(provider.blocked === null) } },
@@ -356,18 +373,9 @@ export class SetupView {
           provider.blocked === null ? chip("ready", "ok") : chip("needs setup", "warn"),
         ),
       ),
-      facts,
-      this.guide(provider, roles.length > 0, setup.platform),
-      gateway === null ? null : h(
-        "p",
-        { class: "provider-vars" },
-        "Change with ",
-        h("code", { text: gateway.baseUrlVar }),
-        ", ",
-        h("code", { text: gateway.configDirVar }),
-        ", ",
-        h("code", { text: gateway.maxContextVar }),
-      ),
+      h("p", { class: "provider-summary", text: usageText(usage, "agent", now) }),
+      provider.blocked === null ? null : h("p", { class: "provider-blocked", text: provider.blocked }),
+      details,
     );
   }
 
@@ -441,6 +449,7 @@ export class SetupView {
   }
 
   private startEditing(roles: readonly SheetRole[]): void {
+    if (this.last?.setup) this.sheetKey = this.currentChoice(this.last.setup)?.key ?? null;
     this.draft = roles.map((role) => ({ role: role.role, lanes: [...role.lanes] }));
     this.sheetResult = null;
     this.confirmDiversity = false;
@@ -497,6 +506,7 @@ export class SetupView {
     const picker = h("select", { class: "sheet-select", attrs: { "aria-label": "Which model sheet to show" } },
       ...choices.map((entry) => h("option", { text: `${entry.title}${entry.sheet.present ? "" : entry.project === null ? " (not written)" : " (uses global)"}`, attrs: { value: entry.key } })));
     if (choice !== null) picker.value = choice.key;
+    picker.disabled = this.draft !== null || this.sheetBusy;
     picker.addEventListener("change", () => this.selectSheet(picker.value));
 
     const children: (Node | null)[] = [];
@@ -514,6 +524,7 @@ export class SetupView {
         sheet.unprobed ? chip("not probed", "warn") : sheet.present ? chip("probed by setup", "ok") : null,
         choice.project !== null ? h("span", { class: "quiet", text: ` ${plural(choice.project.sessions, "session")} in the window` }) : null,
       );
+      if (this.draft !== null) children.push(h("p", { class: "draft-note", text: "Unsaved draft. It stays here while you browse other pages. Save or discard it before changing sheets." }));
       children.push(status, h("div", { class: "sheet-head" }, h("span", { class: "mono sheet-path", title: sheet.path, text: sheet.path })));
 
       if (this.draft === null) {
@@ -583,7 +594,7 @@ export class SetupView {
     return h(
       "section",
       { class: "setup-section" },
-      h("div", { class: "setup-title" }, h("h3", { text: "Model roles" }), h("div", { class: "setup-tools" }, picker)),
+      h("div", { class: "setup-title" }, h("h3", { text: "Assignments" }), h("div", { class: "setup-tools" }, picker)),
       ...children,
       h("div", { class: "guide" }, h("p", { text: "A sheet written here is checked against the installed model matrix but not probed. Setup probes every assigned model live and rewrites the sheet; run it when a lane should be proven before real work." }), command(SETUP_COMMAND)),
     );
@@ -613,7 +624,7 @@ export class SetupView {
     return h(
       "section",
       { class: "setup-section" },
-      h("div", { class: "setup-title" }, h("h3", { text: "Skills" }), this.skillCount, h("div", { class: "setup-tools" }, this.search, this.sortButton, this.principlesButton)),
+      h("div", { class: "setup-title" }, h("h3", { text: "Installed skills" }), this.skillCount, h("div", { class: "setup-tools" }, this.search, this.sortButton, this.principlesButton)),
       this.skillList,
     );
   }
@@ -682,7 +693,7 @@ export class SetupView {
   }
 
   private rerender(): void {
-    if (this.last !== null) this.render(this.last);
+    if (this.last !== null) this.render(this.last, true);
   }
 
   private journalSection(input: SetupInput): HTMLElement {
@@ -712,7 +723,7 @@ export class SetupView {
       "section",
       { class: "setup-section" },
       h("div", { class: "setup-title" },
-        h("h3", { text: "Journal" }),
+        h("h3", { text: "Recorded lanes" }),
         chip(on ? "on" : "off", on ? "ok" : "quiet"),
         h("span", { class: "rail-count", text: summary }),
         h("div", { class: "setup-tools" },
@@ -743,8 +754,8 @@ export class SetupView {
     };
     if (server !== null) {
       row("Lane journal", chip(server.journal ? "on" : "off", server.journal ? "ok" : "quiet"), server.journal
-        ? "Records external lanes and keeps them 7 days. The Journal section above lists, deletes, and turns them off."
-        : "Off: external lanes will not appear. Turn it on in the Journal section above.");
+        ? "Records external lanes and keeps them 7 days. The Journal page lists, deletes, and turns them off."
+        : "Off: external lanes will not appear. Turn it on in the Journal page.");
       row("Window", `last ${server.windowHours} hours`, h("code", { text: "psf-monitor start --hours <n>" }));
       row("Address", h("span", { class: "mono", text: location.host }), h("code", { text: "psf-monitor start --port <n>" }));
       row("Monitor", h("span", { class: "mono", text: server.version }), `pid ${server.pid} · started ${ago(server.startedAt, input.now)} · watching by ${server.watching === "events" ? "file events" : "polling"}`);
@@ -758,7 +769,7 @@ export class SetupView {
     return h(
       "section",
       { class: "setup-section" },
-      h("div", { class: "setup-title" }, h("h3", { text: "Settings" })),
+      h("div", { class: "setup-title" }, h("h3", { text: "Local monitor" })),
       h("table", { class: "role-table setting-table" }, h("tbody", {}, ...rows)),
       h("p", { class: "setup-note" }, "The same list prints in a terminal with ", h("code", { text: "psf-monitor setup" }), "."),
     );

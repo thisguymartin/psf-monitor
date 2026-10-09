@@ -7,6 +7,7 @@ import { h, icon, providerIcon } from "./dom.ts";
 export interface RailEvents {
   select(root: AgentId): void;
   scope(next: Scope): void;
+  close(): void;
 }
 
 export const SCOPE_LABEL: Record<Scope, string> = { pstack: "pstack sessions", normal: "Other sessions", all: "All sessions" };
@@ -76,10 +77,11 @@ export class Rail {
     });
     this.empty = h("p", { class: "rail-empty" });
     this.foot = h("p", { class: "rail-foot" });
+    const close = h("button", { class: "icon-button rail-close", attrs: { type: "button", "aria-label": "Close sessions" }, on: { click: () => this.events.close() } }, icon("close"));
     this.element = h(
       "nav",
-      { class: "rail", attrs: { "aria-label": "Sessions" } },
-      h("header", { class: "rail-head" }, h("span", { class: "rail-names" }, this.title, this.count), this.scopeSelect),
+      { class: "rail", attrs: { id: "session-navigation", "aria-label": "Sessions" } },
+      h("header", { class: "rail-head" }, h("span", { class: "rail-names" }, this.title, this.count), this.scopeSelect, close),
       h("div", { class: "rail-scroll" }, ...sections, this.empty),
       this.foot,
     );
@@ -93,6 +95,8 @@ export class Rail {
     footer: string,
     scope: Scope,
   ): void {
+    const focused = document.activeElement instanceof HTMLElement && this.element.contains(document.activeElement)
+      ? document.activeElement.dataset.session : undefined;
     this.scope = scope;
     this.scopeSelect.value = scope;
     const rows = new Map<Group, HTMLElement[]>(GROUPS.map(({ key }) => [key, []]));
@@ -111,6 +115,10 @@ export class Rail {
     this.empty.hidden = roots.length > 0;
     this.count.textContent = String(roots.length);
     this.foot.textContent = footer;
+    if (focused !== undefined) {
+      const target = Array.from(this.element.querySelectorAll<HTMLButtonElement>("[data-session]")).find((button) => button.dataset.session === focused);
+      (target ?? this.scopeSelect).focus({ preventScroll: true });
+    }
   }
 
   private row(root: AgentNode, counts: Descendants | undefined, group: Group, selected: boolean, now: number): HTMLElement {
@@ -124,6 +132,7 @@ export class Rail {
         title: `${root.title}\n${kindLabel(root)}${root.cwd === null ? "" : `\n${root.cwd}`}`,
         attrs: {
           type: "button",
+          "data-session": root.id,
           "data-group": group,
           "data-status": root.status.kind,
           "data-harness": root.harness,

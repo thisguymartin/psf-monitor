@@ -21,7 +21,7 @@ export async function buildAssets(): Promise<Assets> {
   }
   return {
     html: readFileSync(join(WEB_DIR, "index.html"), "utf8"),
-    css: readFileSync(join(WEB_DIR, "app.css"), "utf8"),
+    css: ["app.css", "overview.css"].map((file) => readFileSync(join(WEB_DIR, file), "utf8")).join("\n"),
     js: await bundle.text(),
   };
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { AgentId, AgentNode } from "./domain.ts";
-import { filterTree, matchesAgent, type AgentFilter } from "./explorer.ts";
+import { branchHealth, filterTree, matchesAgent, type AgentFilter } from "./explorer.ts";
 import { treeOf, withoutSkills } from "./graph.ts";
 
 const now = Date.parse("2026-10-05T12:00:00Z");
@@ -20,6 +20,31 @@ const parent = node("finished parent", root.id);
 const child = node("running child", parent.id, { kind: "running", evidence: "pid" });
 const sibling = node("other work", root.id);
 const tree = treeOf(root.id, new Map([root, parent, child, sibling].map((entry) => [entry.id, entry])))!;
+
+describe("collapsed branch health", () => {
+  it("reveals running, failed, and stalled descendants without changing the parent's own status", () => {
+    const failed = node("failed child", parent.id, { kind: "failed", at: null, reason: "Build failed" });
+    const stale = node("silent child", child.id, { kind: "running", evidence: "lifecycle" });
+    const nested = treeOf(root.id, new Map([root, parent, child, sibling, failed, stale].map((entry) => [entry.id, entry])))!;
+    const health = branchHealth(nested, now);
+    expect(health.get(parent.id)).toEqual({ running: 1, failed: 1, stalled: 1 });
+    expect(health.get(root.id)).toEqual({ running: 1, failed: 1, stalled: 1 });
+    expect(health.get(child.id)).toEqual({ running: 0, failed: 0, stalled: 1 });
+    expect(health.get(failed.id)).toEqual({ running: 0, failed: 0, stalled: 0 });
+    expect(health.get(sibling.id)).toEqual({ running: 0, failed: 0, stalled: 0 });
+    expect(parent.status.kind).toBe("done");
+  });
+
+  it("counts agents through skill wrappers once, whether skills are shown or hidden", () => {
+    const skill: AgentNode = { ...parent, status: { kind: "running", evidence: "pid" }, flavor: { kind: "skill", skill: "review", trigger: { kind: "user" }, runner: root.id } };
+    const nodes = new Map([root, skill, child].map((entry) => [entry.id, entry]));
+    const shown = branchHealth(treeOf(root.id, nodes)!, now);
+    const hidden = branchHealth(treeOf(root.id, withoutSkills(nodes))!, now);
+    expect(shown.get(root.id)).toEqual({ running: 1, failed: 0, stalled: 0 });
+    expect(shown.get(skill.id)).toEqual(shown.get(root.id));
+    expect(hidden.get(root.id)).toEqual(shown.get(root.id));
+  });
+});
 
 describe("agent explorer filters", () => {
   it("keeps the path to running descendants without counting ancestors as matches", () => {

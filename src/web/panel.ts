@@ -89,7 +89,7 @@ export class Panel {
 
   constructor(private readonly events: PanelEvents) {
     this.glyph = h("span", { class: "panel-glyph" });
-    this.title = h("h2", { class: "panel-title", attrs: { id: "panel-title" } });
+    this.title = h("h2", { class: "panel-title", attrs: { id: "panel-title", tabindex: "-1" } });
     this.kind = h("p", { class: "panel-kind" });
     this.chip = h("p", { class: "status-chip" });
     this.facts = h("dl", { class: "facts" });
@@ -230,6 +230,10 @@ export class Panel {
     this.element.dataset.open = "true";
     this.applyWidth();
     this.renderHeader(now);
+  }
+
+  focus(): void {
+    this.title.focus({ preventScroll: true });
   }
 
   close(): void {
